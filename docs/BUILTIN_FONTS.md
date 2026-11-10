@@ -24,3 +24,12 @@ cp boards/pico/src/main/assets/ui-hanzi.bin boards/metalio47/src/main/assets/ui-
 
 两板测试视图运行 `pico_builtin_font_host_test.py`、`reader_hanzi_fallback_host_test.py` 和 `ui_hanzi_host_test.py`，验证字符覆盖、原轮廓像素、界面补字、字宽、字体回退及内存失败恢复。
 Run the named regressions in both board test views to verify coverage, original outline/UI pixels, advances, fallback and allocation-failure recovery.
+
+## 越南语 / Vietnamese (local, Pico only)
+
+Pico 内建轮廓追加 103 个越南语字符（Ă Đ Ĩ Ũ Ơ Ư 及 U+1EA0–1EF9 全部带调字母、₫），只追加字形，原 1263 个轮廓的像素与度量不变；S31 未改。
+Pico builtin outlines gain 103 Vietnamese characters (Ă Đ Ĩ Ũ Ơ Ư, all of U+1EA0–1EF9, ₫). Glyphs are only appended; the original 1263 outlines stay pixel/metric identical. S31 is unchanged.
+
+```sh
+python3 tools/add_vi_outlines.py --src /path/to/NotoSansCJK-Medium.ttc   # or a static Noto Sans SC Medium
+```
