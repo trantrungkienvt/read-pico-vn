@@ -63,6 +63,8 @@ enum EpdDrawError update_display_fast_page(EpdiyHighlevelState* hl);
 /// Arm fixed navigation for the next main-screen output; tag shelf exit and actual navigation so same-page repaints do not animate.
 void display_main_transition_arm(const void* owner, bool leaving_shelf, bool changing_page);
 #if KIIKO_BOARD_METALIO47
+/// 仅真实快刷跨主页的背景擦白许可；调用后须恢复原值。/ Scoped fast root background permission; restore after presentation.
+bool display_main_fast_background_set(bool active);
 /// Scope extra white erasure to an actual switch between visible main tabs; returns the previous scope.
 bool display_main_switch_erase_set(bool active);
 /// 仅书架切回首页的下半内容区增强擦白，返回旧作用域。/ Scope stronger lower-body white drive to shelf-to-home only; returns prior scope.

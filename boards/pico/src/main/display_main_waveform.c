@@ -277,3 +277,33 @@ const EpdWaveform* display_settings_scroll_waveform(void) {
     waveform.temp_intervals=base->temp_intervals;
     return &waveform;
 }
+
+// 设置列表滑动保留短黑白路径，只加强白向擦除；原FOLLOW/阅读/静态灰阶表均不变。
+// Keep short BW settings motion, strengthening only white erasure without changing FOLLOW, reader or static-gray tables.
+static uint8_t s_settings_motion_data[12][16][4];
+static const EpdWaveformPhases s_settings_motion_phases={12,(const uint8_t*)s_settings_motion_data,NULL};
+static const EpdWaveformPhases* s_settings_motion_ranges[]={&s_settings_motion_phases};
+static const EpdWaveformMode s_settings_motion_mode={MODE_DU,1,s_settings_motion_ranges};
+static const EpdWaveformMode* s_settings_motion_modes[]={&s_settings_motion_mode};
+static const EpdWaveformTempInterval s_settings_motion_intervals[]={{.min=0,.max=50}};
+const EpdWaveform PICO_SETTINGS_MOTION_WAVEFORM={
+    .num_modes=1,.num_temp_ranges=1,.mode_data=s_settings_motion_modes,
+    .temp_intervals=s_settings_motion_intervals};
+
+const EpdWaveform* display_settings_motion_waveform(void) {
+    static bool ready;
+    if(!ready) {
+        const EpdWaveformPhases* follow=e0470_waveform_phases(&E0470_FOLLOW_WAVEFORM,MODE_DU);
+        if(!follow||!follow->luts||follow->phase_times||follow->phases!=8||
+           E0470_FOLLOW_WAVEFORM.num_temp_ranges!=1||!E0470_FOLLOW_WAVEFORM.temp_intervals||
+           E0470_FOLLOW_WAVEFORM.temp_intervals[0].min!=0||
+           E0470_FOLLOW_WAVEFORM.temp_intervals[0].max!=50)return NULL;
+        memcpy(s_settings_motion_data,follow->luts,8u*64u);
+        for(int f=8;f<12;++f)for(int from=0;from<15;++from)
+            s_settings_motion_data[f][15][from/4]|=(uint8_t)(2u<<(6-2*(from%4)));
+        // 拖动期间保持白底，松手时由灰阶定稿清残影。
+        // Hold white backgrounds during motion and clean residual ghosts in the final gray update on lift.
+        ready=true;
+    }
+    return &PICO_SETTINGS_MOTION_WAVEFORM;
+}

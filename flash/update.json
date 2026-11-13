@@ -1,12 +1,12 @@
 {
   "schema": 1,
-  "version": "0.3.3-rc105",
+  "version": "0.3.3-rc107",
   "project": "Read_Pico",
   "board": "RDP-G01-W",
   "layout": "pico-dual-4m-v1",
   "minimum_base_version": "0.3.3-rc72",
-  "url": "https://wegooo-cell.github.io/read-pico-reader/Pico-update-0.3.3-rc105.bin",
-  "size": 4141360,
-  "sha256": "0759b4c162bdbbe9634ba0a4969ed8ed619fcbc96db37bdd477822390a4e9d4f",
-  "notes": "1. 内建字体扩至7668字符，优化正文缺字和灰阶粗细\n2. 新增默认全屏、阅读线范围开关\n3. 优化锁屏唤醒字体、传书速度和首次书架加载\n4. 修复全屏点击、工具栏和书架分页\n保留设置，可回退rc104。"
+  "url": "https://wegooo-cell.github.io/read-pico-reader/Pico-update-0.3.3-rc107.bin",
+  "size": 4133056,
+  "sha256": "4d74d7b5687e621a6b7483834083eea50d7c9f26bd04f54ca39644a209f2b8de",
+  "notes": "设置列表快滑松手直接滚动约半屏，松手后立即清理残影。\n阅读缓存迁入 .kiikoread 目录。\n阅读和主页切换恢复 RC104 刷新方式。\n锁屏浅睡前确认屏幕断电，未通过时重试。"
 }

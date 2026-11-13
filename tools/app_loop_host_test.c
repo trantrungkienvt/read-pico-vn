@@ -134,6 +134,7 @@ void ble_pt_cancel_recent(void) {assert(!ble_enabled);}
 bool app_settings_ble_turner(void) {return ble_enabled;}
 void app_settings_set_ble_turner(bool enabled) {ble_enabled=enabled;}
 void ble_pt_reset_failure(void) {++ble_resets;}
+bool ble_pt_take_standby(void) {return false;}
 bool ble_pt_pop_key(ble_pt_event_t *e) {(void)e;return false;}
 bool ble_pt_pop_raw(ble_pt_raw_t *e) {(void)e;return false;}
 void read_pico_transfer_get_status(read_pico_transfer_status_t *s) {*s=transfer_status;}

@@ -106,10 +106,11 @@ void rails_idle_check(int64_t now_ms) {
     pico_online_display_end(held);
 }
 
-// 20 相完整/原厂 DU 按厂家时序走 FULL；只有触摸笔迹用的 8 帧跟随 DU 走 FAST。
-// 20-phase full / vendor DU uses FULL timing; the 8-frame FOLLOW DU used for ink trails uses FAST.
+// 完整原厂DU仍走FULL；FOLLOW8及独立的列表DU12使用既有FAST，不改扫描参数。
+// Native DU retains FULL; FOLLOW8 and scoped list DU12 use existing FAST without changing scan parameters.
 static void use_scan_for(const EpdWaveform* waveform, enum EpdDrawMode mode) {
-    const bool fast = (mode & 0xF) == MODE_DU && waveform == &E0470_FOLLOW_WAVEFORM;
+    const bool fast = (mode & 0xF) == MODE_DU &&
+        (waveform == &E0470_FOLLOW_WAVEFORM || waveform == &PICO_SETTINGS_MOTION_WAVEFORM);
     read_pico_epd_use_scan(fast ? READ_PICO_EPD_SCAN_FAST : READ_PICO_EPD_SCAN_FULL);
     // 高层刷新保持整屏扫描；两条63行可用队列在第127行入队前启动。
     // High-level updates scan the full panel; two 63-slot queues start before line 127 is enqueued.
