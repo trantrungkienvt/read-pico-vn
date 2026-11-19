@@ -84,7 +84,8 @@
  * User2026-11-10: eight51×70 covers,26px single-line titles up to13 characters with dots within the progress boundary and20px authors; right-align22px percentages/18px actual chapter counts above short bars, retaining8px lifting.
  * 用户修订：快刷亚克力采用规则一像素棋盘格，与已缓存封面合并输出，不注册灰区或等待框架先显示；未缓存封面继续有界延后解码。普通及水波纹保留灰阶，切页/锁屏取消旧目标。
  * 用户2026-11-09授权：各样式/主页模式按页成品缓存到TF及有界内存；冷封面限时准备并整组显示，文件间检查导航。
- * User2026-11-09: composed pages persist to TF/bounded RAM per style/main mode; cold covers remain bounded, grouped and navigation-cancellable.
+ * 用户2026-11-14：预热书架成品留在有界PSRAM，单本封面复用TF缓存，切页一次显示完整封面。
+ * User2026-11-14: keep warmed shelf rasters in bounded PSRAM and reuse individual SD cover files; present complete artwork in the first frame.
  * 用户修订：阅读背景先列pictures图片、忽略隐藏文件，点开预览上下切换，返回目录；背景按整屏坐标固定，不随文字边距或全屏状态缩放。
  * User revision: fast acrylic uses a regular one-pixel checkerboard in the same output as cached covers, without gray registration or a furniture-first wait; uncached covers retain bounded lazy decoding. Ordinary/water retain grays; page/lock changes cancel stale targets.
  * 用户要求采用PR17的快速水波纹，并最新指定8条带、每拍11090us；每次显式设置，结束恢复先前节拍，避免影响主页动画。全刷、插图及失败恢复保留原优先级。
@@ -177,7 +178,10 @@ extern const app_desc_t app_device_settings;
 #include "ble_page_turner.h"
 #include "book_layout.h"
 #include "book_cover.h"
+#include "book_cover_auto.h"
 #include "book_cover_jobs.h"
+#include "metalio_cover_cache.h"
+#include "ota_online.h"
 #include "book_shelf_page_cache.h"
 #include "book_lock_collage.h"
 #include "book_epub.h"
@@ -186,6 +190,8 @@ extern const app_desc_t app_device_settings;
 #include "book_progress.h"
 #include "book_font_size.h"
 #include "book_title.h"
+#include "book_chapter_lead.h"
+#include "book_weread_cover.h"
 #include "book_added.h"
 #include "book_ticket.h"
 #include "sleep.h"
@@ -246,7 +252,7 @@ extern const app_desc_t app_device_settings;
 #define BOOKMARK_MAX 24
 #define BOOKMARK_ROWS 6
 
-typedef enum { SHELF, READING, TOC, MANAGE, BULK, IMPORT, SEARCH, EDIT } book_view_t;
+typedef enum { SHELF, READING, TOC, MANAGE, BULK, IMPORT, SEARCH, EDIT, COVER_LOOKUP } book_view_t;
 typedef enum {
     READER_PANEL_NONE,
     READER_PANEL_TOOLS,
@@ -267,6 +273,7 @@ typedef enum {
     READER_PANEL_KEY_PICKER,
     READER_PANEL_FONT_RECOVERY,
     READER_PANEL_READING_DISPLAY,
+    READER_PANEL_HEADING_SETTINGS,
     READER_PANEL_TOUCH_SETTINGS,
     READER_PANEL_TOUCH_MORE,
     READER_PANEL_READING_LIGHT,
@@ -300,6 +307,8 @@ typedef struct {
     char author[128];
     char path[BOOK_STORE_PATH_MAX];
     uint32_t size;
+    int64_t modified;
+    bool cover_identity_known;
     uint16_t chapter;
     bool chapters_checked;
     uint16_t chapters; ///< 已有索引的真实总数；0为未知 / Actual cached total, zero means unknown
@@ -314,12 +323,14 @@ typedef struct {
 static const char* TAG = "book";
 static book_view_t s_view;
 static int s_presented_view = -1;
+static bool s_txt_opening;
 static bool s_reader_image_refresh_pending;
 static bool s_reader_turn_pending;
 // 只记录成功推屏的纯正文基准，避免跨章或退出插图时误用文字波形。
 // Track only successfully presented text-only bodies, protecting chapter and image transitions.
 static bool s_reader_text_frame;
 static char s_requested_open[BOOK_STORE_PATH_MAX];
+static bool s_shelf_open_queued;
 static bool s_requested_open_home;
 static bool s_requested_fullscreen = false;
 static bool s_requested_resume_mode;
@@ -331,7 +342,7 @@ static struct {
     uint8_t *gray, *fast_bits;
     unsigned width, height;
     uint8_t fast_contrast, fast_phase;
-    bool fast_white_edge;
+    bool fast_white_edge, generated;
 } s_covers[BOOK_ROWS];
 static unsigned s_cover_pending_mask, s_cover_decode_mask, s_cover_warm_mask;
 static unsigned s_cover_dirty_mask, s_cover_present_mask;
@@ -405,6 +416,10 @@ void app_book_return_from_shelf_style(void){s_manage_style_restore=true;}
 static bool s_shelf_cache_valid, s_cache_sd_present, s_cache_sd_mounted;
 static uint8_t s_cache_shelf_style;
 static bool s_scan_pending, s_clear_confirm;
+static bool shelf_waiting_for_index(void) {
+    if (s_view == SHELF && s_visible_count > 0) return false;
+    return s_scan_pending;
+}
 static reader_panel_t s_reader_panel;
 // 本章页码草稿不改变阅读位置；撤销保存文字锚点，重排后仍能回到原文。
 // Draft chapter pages never move the reader; undo keeps a text anchor across reflow.
@@ -457,6 +472,9 @@ static char* s_text;
 bool app_book_reader_body_visible(void) {
     return s_view == READING && s_text && s_reader_panel == READER_PANEL_NONE && !s_clear_confirm;
 }
+bool app_book_reading_active(void) {
+    return s_view == READING && s_text;
+}
 static blk_t* s_blocks;
 // 书内字体的 run 表与块表同生共死：都来自同一次 html_text 解析，排版直接借用。
 // The face run table lives and dies with the block table: both come from the same html_text
@@ -470,7 +488,7 @@ static bool s_book_fonts_applied;
 // 字体开关改了之后要重排当前章，但那次重排不能在触摸回调里做：栈太深。
 // The font switch needs the current chapter re-typeset, but not from the touch callback: the
 // stack there is too deep.
-static bool s_fonts_reload_pending;
+static bool s_fonts_reload_pending, s_reader_rule_pending;
 // 只计用户主动换字体后的实际回退，每次选择最多记一次；预览和后台重试不计数。
 // Count actual fallbacks after explicit choices once each, excluding preview loads and background retries.
 static unsigned s_font_fallbacks;
@@ -506,6 +524,8 @@ static size_t s_page_images_for = SIZE_MAX;
 static uint32_t s_page_images_generation;
 static size_t s_block_count;
 static size_t s_text_len, s_chapter, s_page;
+static size_t s_part_base, s_part_begin, s_part_end;
+static bool s_part_more;
 // 整页插图的双指缩放：1000 为原始大小；缩放与位置只属于当时那一页，换页自动还原。
 // 图像中心用屏幕坐标保存，双指中点既是缩放锚点也是平移把手；单指拖动同样平移。
 // Two-finger zoom for a whole-page illustration: 1000 is original size, and the scale plus
@@ -530,15 +550,14 @@ static int64_t s_image_zoom_draw_ms;
 static bool s_image_zoom_bw;
 static bool s_image_pan_active;
 static uint16_t s_image_pan_x, s_image_pan_y;
-static size_t s_selected_toc = SIZE_MAX;
+static size_t s_selected_toc = SIZE_MAX, s_selected_toc_offset;
 static bool s_toc_jump_open, s_toc_jump_drag;
 static int s_toc_jump_percent;
 static size_t s_jump_offset = SIZE_MAX, s_jump_page;
 static uint32_t s_file_size;
 static int s_px, s_margin, s_line_spacing, s_turns, s_unsaved;
 static int64_t s_poll_ms, s_last_turn_ms;
-static int64_t s_stats_last_ms, s_stats_activity_ms;
-static uint32_t s_stats_pending_ms, s_stats_pending_turns;
+static int64_t s_stats_activity_ms;
 static uint32_t s_session_read_ms, s_session_turns;
 static int s_font_page;
 static int s_reader_slider = -1;
@@ -592,6 +611,7 @@ static void render(app_ctx_t* ctx, uint8_t* fb);
 static void draw_reader_panel(uint8_t* fb);
 static EpdRect reader_slider_rect(int slider);
 static void scan_shelf(app_ctx_t* ctx);
+static void refresh_cached_progress(app_ctx_t *ctx);
 static void copy_text(char* dst, size_t cap, const char* src);
 static void fit_text(char* text, int px, int width);
 static void free_book(void);
@@ -607,6 +627,7 @@ bool app_book_request_open(const char* path) {
     if (!path || !path[0] || strnlen(path, sizeof(s_requested_open)) >= sizeof(s_requested_open)) return false;
     if (!book_file_path_supported(path)) return false;
     copy_text(s_requested_open, sizeof(s_requested_open), path);
+    s_shelf_open_queued = false;
     s_requested_open_home = false;
     s_requested_fullscreen = app_settings_reader_default_fullscreen();
     s_requested_resume_mode = false;
@@ -658,11 +679,6 @@ static size_t fb_bytes(void) { return (size_t)epd_width() * epd_height() / 2; }
 // NONE always denotes body reading; persistent nonfullscreen tools never block prefetch or fast turns.
 // 应用层只选择PR已有的差分/整块出口，布局范围由当前阅读UI决定。
 // The app selects the PR's existing difference/full-area API; current reader UI owns its crop.
-static enum EpdDrawError reader_present_crop(EpdiyHighlevelState *hl,const EpdWaveform *wave,
-                                            enum EpdDrawMode mode,EpdRect area,bool full) {
-    return full?update_display_area_full_with(hl,wave,mode,area):
-        update_display_area_diff_with(hl,wave,mode,area);
-}
 // 常驻工具栏与显式呼出共用可见性和点击判定。/ Persistent and explicitly opened tools share paint/hit visibility.
 static bool reader_tools_visible(void) {
     return !s_reader_fullscreen&&(s_reader_panel==READER_PANEL_TOOLS||s_reader_panel==READER_PANEL_NONE);
@@ -797,8 +813,22 @@ static unsigned s_chapters_pending;static bool s_chapters_started,s_chapters_cha
 static int s_prefetch_step,s_prefetch_index;static bool s_prefetch_active;static int64_t s_prefetch_after;
 static book_shelf_page_key_t s_shelf_page_base;
 static bool s_shelf_page_key_valid,s_shelf_page_loading,s_shelf_page_cached,s_shelf_page_cache_allowed;
+static uint8_t s_cover_retry_count[BOOK_ROWS];
+static int64_t s_cover_retry_ms[BOOK_ROWS];
+static unsigned s_chapters_pending;static bool s_chapters_started,s_chapters_changed;
+static int shelf_record_prefetch_result(unsigned generation, unsigned slot, int index, bool render_auto);
+static uint32_t s_shelf_catalog_epoch;
+static bool s_shelf_recheck_on_return;
+static unsigned s_shelf_no_artwork_mask;
+static struct {
+    unsigned generation;
+    unsigned pending;
+    int64_t next_ms;
+} s_first_page_warm;
+static bool s_shelf_index_preloaded;
+static int64_t s_shelf_input_ms;
 static void invalidate_covers(void) {
-    book_shelf_page_pause();
+    s_shelf_no_artwork_mask = 0;
     s_chapters_pending=0;s_chapters_started=s_chapters_changed=false;
     s_prefetch_step=0;s_prefetch_active=false;s_prefetch_after=0;
     s_shelf_page_key_valid=s_shelf_page_loading=s_shelf_page_cached=s_shelf_page_cache_allowed=false;
@@ -806,6 +836,8 @@ static void invalidate_covers(void) {
     release_guard_cache();
     s_cover_pending_mask = s_cover_decode_mask = s_cover_warm_mask = 0;
     s_cover_dirty_mask = s_cover_present_mask = 0;
+    memset(s_cover_retry_count, 0, sizeof(s_cover_retry_count));
+    memset(s_cover_retry_ms, 0, sizeof(s_cover_retry_ms));
     for (int i = 0; i < BOOK_ROWS; ++i) {
         free(s_covers[i].gray);
         free(s_covers[i].fast_bits);
@@ -865,7 +897,11 @@ static void prepare_fast_covers(void) {
         free(s_covers[row].gray); s_covers[row].gray = NULL;
     }
 }
-void app_book_cover_mode_changed(void) { invalidate_covers(); }
+void app_book_cover_mode_changed(void) {
+    app_book_shelf_prefetch_cancel();
+    metalio_cover_cache_clear();
+    invalidate_covers();
+}
 static uint8_t* load_cover_gray(const char* source, const char* title, const char* author,
                                 bool decode, bool* pending) {
     *pending = false;
@@ -929,7 +965,63 @@ static unsigned shelf_page_mask(app_ctx_t *ctx) {
     if(count>shelf_rows())count=shelf_rows();
     return count>0?(1u<<count)-1:0;
 }
+static bool shelf_cover_ram_hit(int index, int row, bool load) {
+    const shelf_entry_t *item = &s_shelf[index];
+    if (!item->cover_identity_known || !pico_boot_asset_allowed(item->path)) return false;
+    const unsigned bit = 1u << row;
+    if (book_cover_shelf_no_artwork(item->path, item->name, item->author, item->size, item->modified, false)) {
+        if (load) s_shelf_no_artwork_mask |= bit;
+        return true;
+    }
+    const EpdRect rect = shelf_cover_image(row);
+    const bool fast = app_settings_main_fast_refresh();
+    const bool list = shelf_display_style() == 5;
+    const book_fast_cover_key_t key = {
+        rect.width, rect.height, SHELF_FAST_COVER_STRIDE, app_settings_system_contrast(),
+        (rect.x & 3) | ((rect.y & 3) << 2),
+    };
+    metalio_cover_meta_t meta;
+    // 成品键与工作线程一致，首帧只拷贝内存，不重新访问原书或TF封面文件。
+    // Match the worker's finished raster key; the first frame copies RAM without accessing the book or SD cache.
+    if (!book_cover_shelf_ram_read(item->path, item->name, item->author, item->size, item->modified,
+                                 list, fast, key, NULL, 0, &meta)) return false;
+    if (!load) return true;
+    const size_t bytes = (size_t)(fast ? key.stride : meta.width) * meta.height;
+    if (heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) < SHELF_FAST_CACHE_RESERVE + bytes) return false;
+    uint8_t *pixels = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!pixels) return false;
+    if (!book_cover_shelf_ram_read(item->path, item->name, item->author, item->size, item->modified,
+                                 list, fast, key, pixels, bytes, &meta)) {
+        free(pixels);
+        return false;
+    }
+    s_covers[row].gray = fast ? NULL : pixels;
+    s_covers[row].fast_bits = fast ? pixels : NULL;
+    s_covers[row].width = meta.width;
+    s_covers[row].height = meta.height;
+    s_covers[row].fast_white_edge = meta.white_edge;
+    s_covers[row].fast_contrast = key.contrast;
+    s_covers[row].fast_phase = key.phase;
+    s_covers[row].generated = false;
+    s_cover_dirty_mask |= bit;
+    return true;
+}
+static void shelf_record_cover_result(int index, int state, const book_cover_result_t *result) {
+    shelf_entry_t *item = &s_shelf[index];
+    if ((state <= 0 && state != BOOK_COVER_JOB_NO_ARTWORK) || result->size != item->size) return;
+    item->modified = result->modified;
+    item->cover_identity_known = true;
+    if (result->metadata) {
+        item->chapters = result->chapters;
+        item->chapters_checked = true;
+    }
+    if (state == BOOK_COVER_JOB_NO_ARTWORK)
+        book_cover_shelf_no_artwork(item->path, item->name, item->author, item->size, item->modified, true);
+}
 static bool prepare_shelf_page(app_ctx_t *ctx) {
+    if (s_prefetch_active && (!s_shelf_page_key_valid ||
+        s_covers[0].index != ctx->leaf * shelf_rows()))
+        (void)shelf_record_prefetch_result(s_cover_generation, 0, s_prefetch_index, false);
     book_shelf_page_key_t base;book_shelf_page_key_init(&base);
     const int options[]={ctx->leaf,shelf_rows(),shelf_display_style(),
         app_settings_main_refresh_mode(),app_settings_system_contrast(),epd_get_rotation(),
@@ -938,6 +1030,8 @@ static bool prepare_shelf_page(app_ctx_t *ctx) {
     book_shelf_page_key_add(&base,s_query,strlen(s_query)+1);
     const char *font=app_settings_system_font_path();
     book_shelf_page_key_add(&base,font,strlen(font)+1);
+    const uint64_t cover_font = book_auto_cover_font_key();
+    book_shelf_page_key_add(&base, &cover_font, sizeof(cover_font));
     book_shelf_page_layout_t layout={.area=ui_rotate_rect_to_fb((EpdRect){0,160,UI_LOCK_WIDTH,832}),
         .width=epd_width(),.height=epd_height()};
     for(int row=0;row<shelf_rows();++row){
@@ -947,38 +1041,31 @@ static bool prepare_shelf_page(app_ctx_t *ctx) {
         book_shelf_page_key_add(&base,item->name,strlen(item->name)+1);
         book_shelf_page_key_add(&base,item->author,strlen(item->author)+1);
         book_shelf_page_key_add(&base,&item->removed,sizeof(item->removed));
+        book_shelf_page_key_add(&base,&item->size,sizeof(item->size));
+        book_shelf_page_key_add(&base,&item->modified,sizeof(item->modified));
         layout.covers[layout.count++]=ui_rotate_rect_to_fb(shelf_cover_image(row));
     }
     book_shelf_page_key_add(&base,&layout,sizeof(layout));
+    const uint32_t catalog[] = {s_shelf_catalog_epoch, book_store_revision()};
+    book_shelf_page_key_add(&base, catalog, sizeof(catalog));
     if(s_shelf_page_key_valid&&!memcmp(&base,&s_shelf_page_base,sizeof(base)))
         return s_shelf_page_cached||s_shelf_page_loading;
     invalidate_covers();s_shelf_page_base=base;s_shelf_page_key_valid=true;
-    book_shelf_page_key_t key=base;
-    // 只在换页/重新进入时读取文件身份；render和命中后的重画不访问TF。
-    // Stat only on page changes/re-entry; rendering and repeated redraws never access SD.
-    bool valid=layout.count>0;
-    for(unsigned row=0;row<layout.count;++row){
-        struct stat st;const char *path=s_shelf[ctx->leaf*shelf_rows()+row].path;
-        if(stat(path,&st)||!S_ISREG(st.st_mode)){valid=false;break;}
-        const int64_t identity[]={(int64_t)st.st_size,(int64_t)st.st_mtime};
-        book_shelf_page_key_add(&key,identity,sizeof(identity));
-    }
-    if(font[0]){
-        struct stat st;if(stat(font,&st))valid=false;
-        else{const int64_t identity[]={(int64_t)st.st_size,(int64_t)st.st_mtime};book_shelf_page_key_add(&key,identity,sizeof(identity));}
-    }
-    s_shelf_page_cache_allowed=valid;
-    if(!valid)return false;
-    book_shelf_page_state_t state=book_shelf_page_request(key,layout);
+    s_shelf_page_cache_allowed = layout.count > 0;
+    book_shelf_page_state_t state = book_shelf_page_request_memory(base, layout);
     s_shelf_page_cached=state==BOOK_SHELF_PAGE_HIT;
     s_shelf_page_loading=state==BOOK_SHELF_PAGE_WAIT;
     if(state==BOOK_SHELF_PAGE_MISS)return false;
     for(int row=0;row<shelf_rows();++row)s_covers[row].index=ctx->leaf*shelf_rows()+row;
-    s_cover_pending_mask=s_shelf_page_loading?shelf_page_mask(ctx):0;
+    s_cover_pending_mask=0;
     s_cover_dirty_mask=s_shelf_page_cached?shelf_page_mask(ctx):0;
     return true;
 }
 
+static bool shelf_is_txt(const char *path) {
+    const char *ext = strrchr(path, '.');
+    return ext && !strcasecmp(ext, ".txt");
+}
 static unsigned prepare_cover_batch(app_ctx_t *ctx,bool cache_only) {
     if(s_view==SHELF&&s_shelf_page_loading){
         book_shelf_page_state_t state=book_shelf_page_poll();
@@ -993,33 +1080,88 @@ static unsigned prepare_cover_batch(app_ctx_t *ctx,bool cache_only) {
     }
     if((s_view!=SHELF&&s_view!=MANAGE&&s_view!=BULK)||(!cache_only&&ctx->touch&&ctx->touch->touched))return 0;
     unsigned changed=0;
+    const bool visible_shelf = s_view == SHELF;
     for(int row=0;row<shelf_rows();++row){
         unsigned bit=1u<<row;if(!(s_cover_pending_mask&bit))continue;
-        if(s_view==SHELF&&app_poll_main_navigation(ctx))return changed;
+        // 失败退避窗口内不再入队，避免每帧重复解码同一本坏书。
+        // Do not re-arm a failed cell inside its backoff window; avoids re-decoding it every frame.
+        if(s_cover_retry_ms[row] > ctx->now_ms) continue;
+        if(s_view==SHELF&&app_touch_input_pending(ctx))return changed;
         int index=ctx->leaf*shelf_rows()+row;
         if(index<0||index>=s_visible_count||s_covers[row].index!=index||s_shelf[index].removed){s_cover_pending_mask&=~bit;continue;}
         EpdRect image=shelf_cover_image(row);
         book_cover_job_t request={.list=s_view==SHELF&&shelf_display_style()==5,
             .fast=s_view==SHELF&&app_settings_main_fast_refresh(),.width=image.width,.height=image.height,
+            .artwork_only=visible_shelf && !shelf_is_txt(s_shelf[index].path),
             .stride=SHELF_FAST_COVER_STRIDE,.contrast=app_settings_system_contrast(),
             .phase=(image.x&3)|((image.y&3)<<2),.x=image.x,.y=image.y};
         copy_text(request.path,sizeof(request.path),s_shelf[index].path);
         copy_text(request.title,sizeof(request.title),s_shelf[index].name);
         copy_text(request.author,sizeof(request.author),s_shelf[index].author);
+        if (s_view == SHELF && !pico_boot_asset_allowed(request.path)) {
+            s_cover_pending_mask &= ~bit;
+            continue;
+        }
         if(!s_cover_generation)s_cover_generation=book_cover_jobs_begin();
+        // 用户2026-11-11：挂载交接/SD未就绪时保留该格稍后重试，不再静默丢弃。
+        // User2026-11-11: keep the cell for a later retry instead of dropping it silently when the
+        // card is in a mount handoff.
+        if(strncmp(request.path,"/sdcard/",8)==0 && !read_pico_sd_io_ready()){
+            s_cover_retry_ms[row]=ctx->now_ms+500;
+            continue;
+        }
         if(!book_cover_jobs_submit(s_cover_generation,row,&request)){
+            // 槽位仍被上一页请求占用时换一代重试；仍失败则退避，绝不丢格。
+            // A generation bump clears stale slot ownership; on failure back off without dropping.
             s_cover_generation=book_cover_jobs_begin();
-            if(!book_cover_jobs_submit(s_cover_generation,row,&request)){s_cover_pending_mask&=~bit;continue;}
+            if(!book_cover_jobs_submit(s_cover_generation,row,&request)){
+                if (visible_shelf) {
+                    if (++s_cover_retry_count[row] >= 2) s_cover_pending_mask &= ~bit;
+                    else s_cover_retry_ms[row] = ctx->now_ms + 60;
+                    continue;
+                }
+                s_cover_retry_ms[row]=ctx->now_ms+800;
+                ESP_LOGW(TAG,"cover submit wait %s",request.path);
+                continue;
+            }
         }
         book_cover_result_t result={0};int state=book_cover_jobs_take(s_cover_generation,row,&result);
         if(!state)continue;
+        if (visible_shelf && (state > 0 || state == BOOK_COVER_JOB_NO_ARTWORK) &&
+            result.size != s_shelf[index].size) {
+            free(result.pixels);
+            s_scan_pending = true;
+            state = -1;
+        }
+        if (visible_shelf) shelf_record_cover_result(index, state, &result);
+        if (visible_shelf && state == BOOK_COVER_JOB_NO_ARTWORK) {
+            s_shelf_no_artwork_mask |= bit;
+            s_cover_pending_mask &= ~bit;
+            continue;
+        }
+        if(state<0){
+            unsigned attempts = 3, retry_ms = 1200;
+            // Retry once quickly so a bad book cannot hold the complete shelf for seconds.
+            if (visible_shelf) { attempts = 2; retry_ms = 60; }
+            if(++s_cover_retry_count[row] < attempts){
+                s_cover_retry_ms[row]=ctx->now_ms+retry_ms;
+                ESP_LOGW(TAG,"cover retry %u %s",(unsigned)s_cover_retry_count[row],request.path);
+            } else {
+                s_cover_pending_mask&=~bit;
+                s_cover_decode_mask&=~bit;
+                s_cover_retry_ms[row]=ctx->now_ms+5000;
+                ESP_LOGW(TAG,"cover failed %s",request.path);
+            }
+            continue;
+        }
         s_cover_pending_mask&=~bit;s_cover_decode_mask&=~bit;
-        if(state<0)continue;
+        s_cover_retry_count[row]=0;s_cover_retry_ms[row]=0;
         free(s_covers[row].gray);free(s_covers[row].fast_bits);
         s_covers[row].gray=result.fast?NULL:result.pixels;
         s_covers[row].fast_bits=result.fast?result.pixels:NULL;
         s_covers[row].width=result.width;s_covers[row].height=result.height;
         s_covers[row].fast_white_edge=result.white_edge;
+        s_covers[row].generated=result.generated;
         s_covers[row].fast_contrast=request.contrast;s_covers[row].fast_phase=request.phase;
         changed|=bit;s_cover_dirty_mask|=bit;
     }
@@ -1032,18 +1174,40 @@ static bool shelf_cover_frame_ready(void) {
     return s_view != SHELF || s_cover_pending_mask == 0;
 }
 static unsigned shelf_cover_reveal_mask(void) {
-    return shelf_cover_frame_ready() ? s_cover_dirty_mask : 0;
+    if (!shelf_cover_frame_ready()) return 0;
+    return s_cover_dirty_mask;
 }
 
+static void prepare_shelf_cover_slots(app_ctx_t *ctx) {
+    if (s_covers[0].index >= 0) return;
+    const int rows = shelf_rows();
+    for (int row = 0; row < rows; ++row) {
+        const int index = ctx->leaf * rows + row;
+        if (index >= s_visible_count) break;
+        s_covers[row].index = index;
+        if (!s_shelf[index].removed &&
+            pico_boot_asset_allowed(s_shelf[index].path) && !shelf_cover_ram_hit(index, row, true))
+            s_cover_pending_mask |= 1u << row;
+    }
+}
 static void prepare_covers(app_ctx_t* ctx) {
     if(s_view!=SHELF&&s_shelf_page_key_valid)invalidate_covers();
     if(s_view==SHELF&&prepare_shelf_page(ctx))return;
     if (s_view != SHELF && s_view != MANAGE && s_view != BULK) return;
+    // Build an actionable frame from the catalog. Cold rasters and decoding belong to the worker.
+    if (s_view == SHELF) {
+        prepare_shelf_cover_slots(ctx);
+        return;
+    }
     int rows = shelf_rows();
     if (s_covers[0].index != ctx->leaf * rows) {
         book_cover_jobs_cancel(s_cover_generation);s_cover_generation=book_cover_jobs_begin();
         s_cover_pending_mask = s_cover_decode_mask = s_cover_warm_mask = 0;
         s_cover_dirty_mask = s_cover_present_mask = 0;
+        // 换页重试计数归零；新页上的同一本书仍会重新尝试一次。
+        // Reset per-row retry state on a page change; the new page starts fresh attempts.
+        memset(s_cover_retry_count, 0, sizeof(s_cover_retry_count));
+        memset(s_cover_retry_ms, 0, sizeof(s_cover_retry_ms));
     }
     for (int row = 0; row < rows; ++row) {
         int index = ctx->leaf * rows + row;
@@ -1051,19 +1215,51 @@ static void prepare_covers(app_ctx_t* ctx) {
         bool packed = s_view == SHELF && app_settings_main_fast_refresh();
         if (s_covers[row].index == index &&
             (packed ? fast_cover_matches(row, image) : s_covers[row].gray != NULL)) continue;
-        if (s_covers[row].index == index && !s_covers[row].gray && !s_covers[row].fast_bits) continue;
+        // 仍待后台解码（或失败退避中）的格子保留原请求，不因首帧渲染重复入队。
+        // A cell still queued (or in failure backoff) keeps its request; a bare failed cell is
+        // retried the next time this page is prepared.
+        if (s_covers[row].index == index && !s_covers[row].gray && !s_covers[row].fast_bits &&
+            ((s_cover_pending_mask & (1u << row)) || s_cover_retry_ms[row] > ctx->now_ms)) continue;
+        const bool index_changed = s_covers[row].index != index;
         free(s_covers[row].gray); free(s_covers[row].fast_bits);
         s_covers[row].gray = s_covers[row].fast_bits = NULL;
         s_covers[row].index = index;
+        // 换页/换书才重置重试计数；同一格的重试沿用已累计次数，避免反复解码。
+        // Reset attempt counters only for a different page/book; retries keep their counts.
+        if (index_changed) { s_cover_retry_count[row] = 0; s_cover_retry_ms[row] = 0; }
         s_cover_dirty_mask &= ~(1u<<row);
         if (index >= s_visible_count || index < 0 || s_shelf[index].removed) continue;
-        // Queue each slot, then gather cheap disk-cache hits before painting; decode misses later.
+        // 用户2026-11-11：成品缓存先同步读卡，首帧就带封面；只有缓存缺失才进后台解码。
+        // User2026-11-11: preload finished rasters from the card so the first frame carries covers;
+        // only cache misses go to the bounded background decoder.
+        bool ready = false;
+        if (packed) {
+            ready = load_shelf_cover_fast(row, index);
+        } else {
+            bool cache_pending = false;
+            uint8_t *gray = load_shelf_cover_gray(row, s_shelf[index].path, s_shelf[index].name,
+                                                  s_shelf[index].author, false, &cache_pending);
+            (void)cache_pending;
+            if (gray) {
+                s_covers[row].gray = gray;
+                if (!(s_view == SHELF && shelf_display_style() == 5)) {
+                    s_covers[row].width = BOOK_COVER_W;
+                    s_covers[row].height = BOOK_COVER_H;
+                }
+                ready = true;
+            }
+        }
+        if(ready){s_cover_pending_mask&=~(1u<<row);s_cover_decode_mask&=~(1u<<row);s_cover_dirty_mask|=1u<<row;continue;}
         s_cover_pending_mask |= 1u << row;
         s_cover_warm_mask |= 1u << row;
         s_cover_warm_after_ms = ctx->now_ms + 1500;
     }
     prepare_fast_covers();
     (void)prepare_cover_batch(ctx, true);
+    ESP_LOGI(TAG, "covers leaf=%d pending=%x decode=%x packed=%d style=%d visible=%d count=%d",
+             ctx->leaf ? 1 : 0, s_cover_pending_mask, s_cover_decode_mask,
+             (int)app_settings_main_fast_refresh(), app_settings_shelf_style(),
+             s_visible_count, s_count);
 }
 
 
@@ -1104,90 +1300,58 @@ static bool shelf_chapters_tick(app_ctx_t *ctx) {
 
 // 空闲时一次预热一本相邻页封面和章节；整页命中仍预热，切页沿用代次取消。
 // Warm one neighbor cover/count at a time even after composed hits; page changes cancel by generation.
+static int shelf_record_prefetch_result(unsigned generation, unsigned slot, int index, bool render_auto) {
+    book_cover_result_t result = {0};
+    const int state = render_auto ? book_cover_jobs_take(generation, slot, &result)
+                                  : book_cover_jobs_take_ready(generation, slot, &result);
+    if (state && index >= 0 && index < s_visible_count && s_store_revision == book_store_revision())
+        shelf_record_cover_result(index, state, &result);
+    free(result.pixels);
+    return state;
+}
+
 static void shelf_prefetch_tick(app_ctx_t *ctx) {
     if(s_view!=SHELF||s_cover_pending_mask||s_chapters_pending||ctx->consumed||ctx->request_app||ctx->request_menu||ctx->request_return||
        (ctx->touch&&ctx->touch->touched)||s_clear_confirm||s_batch_confirm)return;
-    if(!s_prefetch_after){s_prefetch_after=ctx->now_ms+800;return;}
-    if(ctx->now_ms<s_prefetch_after)return;
-    if(s_prefetch_active){
-        book_cover_result_t result={0};int state=book_cover_jobs_take(s_cover_generation,0,&result);if(!state)return;
-        if(state>0&&result.metadata&&s_prefetch_index>=0&&s_prefetch_index<s_visible_count&&result.size==s_shelf[s_prefetch_index].size){
-            s_shelf[s_prefetch_index].chapters=result.chapters;s_shelf[s_prefetch_index].chapters_checked=true;}
-        free(result.pixels);s_prefetch_active=false;s_prefetch_after=ctx->now_ms+100;
+    if (s_shelf_page_pending || s_category_menu || s_sort_menu || pico_online_busy()) return;
+    if(!s_prefetch_after){
+        s_prefetch_after=ctx->now_ms+300;
         return;
     }
-    int rows=shelf_rows();if(s_prefetch_step>=rows*2)return;
-    int step=s_prefetch_step++,leaf=ctx->leaf+(step<rows?1:-1),row=step%rows,index=leaf*rows+row;
-    if(leaf<0||index<0||index>=s_visible_count||s_shelf[index].removed||!pico_boot_asset_allowed(s_shelf[index].path))return;
+    if(ctx->now_ms<s_prefetch_after)return;
+    if(s_prefetch_active){
+        if (!shelf_record_prefetch_result(s_cover_generation, 0, s_prefetch_index, true)) return;
+        s_prefetch_active = false;
+        s_prefetch_after = ctx->now_ms + 25;
+        return;
+    }
+    int rows=shelf_rows();
+    // 提前准备三页；用户前进后再补，防止远页挤掉马上要用的封面。
+    // Keep three pages ahead and refill as the user advances, so distant pages cannot evict imminent covers.
+    if(s_prefetch_step>=rows*3 || s_prefetch_step>=s_visible_count-(ctx->leaf+1)*rows ||
+       !book_cover_jobs_idle())return;
+    int step=s_prefetch_step++,row=step%rows,index=(ctx->leaf+1)*rows+step;
+    if(index<0||index>=s_visible_count||s_shelf[index].removed||!pico_boot_asset_allowed(s_shelf[index].path))return;
+    const bool list = shelf_display_style() == 5;
+    if (shelf_cover_ram_hit(index, row, false)) return;
     EpdRect image=shelf_cover_image(row);
-    book_cover_job_t q={.list=shelf_display_style()==5,.fast=app_settings_main_fast_refresh(),.with_chapters=true,
+    book_cover_job_t q={.list=list,.fast=app_settings_main_fast_refresh(),.with_chapters=true,
+        .artwork_only=!shelf_is_txt(s_shelf[index].path),
         .width=image.width,.height=image.height,.stride=SHELF_FAST_COVER_STRIDE,.contrast=app_settings_system_contrast(),
         .phase=(image.x&3)|((image.y&3)<<2),.x=image.x,.y=image.y};
     copy_text(q.path,sizeof(q.path),s_shelf[index].path);copy_text(q.title,sizeof(q.title),s_shelf[index].name);copy_text(q.author,sizeof(q.author),s_shelf[index].author);
     s_cover_generation=book_cover_jobs_begin();s_prefetch_index=index;
     s_prefetch_active=book_cover_jobs_submit(s_cover_generation,0,&q);
-}
-
-
-// 首页只借用空闲队列预热已有最近书目，不额外扫描全库；不会抢走首页未接收的封面。
-// Home warms known recent books only through a quiescent queue, without scanning the library or stealing Home results.
-static unsigned s_home_shelf_generation;static bool s_home_shelf_pending;
-bool app_book_home_shelf_warm(const char *path,const char *title,const char *author) {
-    if(s_home_shelf_pending){
-        book_cover_result_t result={0};int state=book_cover_jobs_take(s_home_shelf_generation,0,&result);
-        if(!state)return false;
-        free(result.pixels);s_home_shelf_pending=false;return true;
+    if (!s_prefetch_active) {
+        --s_prefetch_step;
+        s_prefetch_after = ctx->now_ms + 500;
     }
-    if(!path||!path[0]||!pico_boot_asset_allowed(path))return true;
-    if(!book_cover_jobs_idle())return false;
-    bool list=shelf_display_style()==5;
-    book_cover_job_t q={.list=list,.with_chapters=true,.width=list?51:164,.height=list?70:214,
-        .stride=SHELF_FAST_COVER_STRIDE,.contrast=app_settings_system_contrast()};
-    copy_text(q.path,sizeof(q.path),path);copy_text(q.title,sizeof(q.title),title);copy_text(q.author,sizeof(q.author),author);
-    s_home_shelf_generation=book_cover_jobs_begin();
-    s_home_shelf_pending=book_cover_jobs_submit(s_home_shelf_generation,0,&q);
-    return !s_home_shelf_pending;
 }
-void app_book_home_shelf_warm_stop(void) {
-    if(s_home_shelf_pending)book_cover_jobs_cancel(s_home_shelf_generation);
-    s_home_shelf_pending=false;s_home_shelf_generation=0;
-}
+
 
 #if defined(ESP_PLATFORM) && defined(__GNUC__) && !defined(__clang__)
 #pragma GCC pop_options
 #endif
-// 首帧短暂汇合TF缓存命中，让题头、书架和封面一起显示；冷解码不无限阻塞。
-// Briefly gather warm TF hits for a complete first frame; never wait indefinitely for cold decoding.
-static void gather_cover_entry(app_ctx_t *ctx) {
-    if(s_view!=SHELF||!s_cover_pending_mask||ctx->request_app||
-       (s_presented_view==(int)SHELF&&!s_shelf_page_pending))return;
-    const int64_t deadline=esp_timer_get_time()+60000;
-    while(s_cover_pending_mask&&esp_timer_get_time()<deadline){
-        if(app_poll_main_navigation(ctx))return;
-        vTaskDelay(1);
-        (void)prepare_cover_batch(ctx,true);
-        if(ctx->request_app)return;
-    }
-}
-
-// 画面和操作优先，预生成只在封面加载完、无触摸的空闲书架运行一次一本。
-// Present and input take priority; warm one cover only on an idle shelf after visible loading completes.
-static void warm_shelf_lock_cover(app_ctx_t *ctx) {
-    if (s_view != SHELF || app_settings_lock_style() != 2 || s_clear_confirm || s_batch_confirm ||
-        s_cover_pending_mask || !s_cover_warm_mask || ctx->now_ms < s_cover_warm_after_ms ||
-        (ctx->touch && ctx->touch->touched) || ctx->request_app || ctx->request_return || ctx->request_menu) return;
-    if (app_poll_main_navigation(ctx)) return;
-    for (int row = 0; row < shelf_rows(); ++row) {
-        const unsigned bit = 1u << row;
-        if (!(s_cover_warm_mask & bit)) continue;
-        s_cover_warm_mask &= ~bit; s_cover_warm_after_ms = ctx->now_ms + 1000;
-        int index = ctx->leaf * shelf_rows() + row;
-        if (index >= 0 && index < s_visible_count && s_covers[row].index == index && !s_shelf[index].removed)
-            (void)book_lock_collage_warm_cover(s_shelf[index].path);
-        (void)app_poll_main_navigation(ctx);
-        break;
-    }
-}
 
 #include "apps/book_shelf_badges.inc"
 
@@ -1247,7 +1411,8 @@ static bool cover_favorite_needs_white_edge(const uint8_t *gray, EpdRect image, 
 }
 static bool shelf_cover_white_edge(int row,EpdRect image) {
     if(s_view==SHELF&&s_shelf_page_cached)return (book_shelf_page_favorite_edges()&(1u<<row))!=0;
-    return shelf_cover_frame_ready()&&((app_settings_main_fast_refresh()&&s_view==SHELF&&fast_cover_matches(row,image))
+    return shelf_cover_frame_ready() &&
+        ((app_settings_main_fast_refresh()&&s_view==SHELF&&fast_cover_matches(row,image))
         ?s_covers[row].fast_white_edge:cover_favorite_needs_white_edge(s_covers[row].gray,image,
             shelf_display_style()==5?s_covers[row].width:BOOK_COVER_W,
             shelf_display_style()==5?s_covers[row].height:BOOK_COVER_H));
@@ -1447,8 +1612,10 @@ static EpdRect shelf_search_rect(int page,int pages) {
 }
 // 静态整页与实时信息分层；不在绘图中读写文件。/ Split static artwork and live information; no file IO while painting.
 static void draw_shelf_page_artwork(app_ctx_t *ctx,uint8_t *fb) {
-    s_shelf_read_ready=false;
-    if(s_scan_pending||s_shelf_page_loading||(s_visible_count&&!shelf_cover_frame_ready())){
+    s_shelf_read_ready = false;
+    // Indexed title cards stay actionable while the next cover frame is prepared.
+    const bool loading = s_scan_pending && !s_visible_count;
+    if (loading) {
         ui_text_fixed_vc(fb,342,610,30,"正在加载书架...",EPD_DRAW_ALIGN_CENTER,false);return;
     }
     const bool lifting=s_pressed_control>=0&&s_pressed_control<shelf_rows();
@@ -1456,14 +1623,20 @@ static void draw_shelf_page_artwork(app_ctx_t *ctx,uint8_t *fb) {
     if(!restored){
         bool complete=s_shelf_page_cache_allowed&&!lifting&&!s_shelf_page_loading&&shelf_cover_frame_ready();
         unsigned edges=0;
+        bool has_artwork = false;
         for(int row=0;row<shelf_rows();++row){
             int i=ctx->leaf*shelf_rows()+row;if(i>=s_visible_count)break;
             EpdRect r=row_rect(row);char name[128];copy_text(name,sizeof(name),s_shelf[i].name);
             if(s_pressed_control==row)r.y-=shelf_display_style()==5?SHELF_LIST_BOUNCE_PX:SHELF_BOOK_LIFT_PX;
             draw_shelf_cover(fb,r,row,name,false);
-            complete=complete&&!s_shelf[i].removed&&(s_covers[row].gray||s_covers[row].fast_bits);
+            bool artwork = (s_covers[row].gray || s_covers[row].fast_bits) &&
+                           (!s_covers[row].generated || shelf_is_txt(s_shelf[i].path));
+            has_artwork |= artwork;
+            const bool title_card = (s_shelf_no_artwork_mask & (1u << row)) != 0;
+            complete = complete && !s_shelf[i].removed && (artwork || title_card);
             if(shelf_cover_white_edge(row,shelf_cover_image(row)))edges|=1u<<row;
         }
+        complete = complete && has_artwork;
         const bool staged=complete&&!s_shelf_page_cached&&book_shelf_page_stage_covers(fb);
         draw_shelf_furniture(fb);
         if(staged)s_shelf_page_cached=book_shelf_page_capture(fb,edges,ctx->now_ms);
@@ -1565,14 +1738,10 @@ static bool shelf_pager_event(app_ctx_t *ctx, const ui_gesture_event_t *ev, app_
     bool decorated = s_pressed_control >= 116 && s_pressed_control <= 119;
     if (start < 0 && !decorated) return false;
     *redraw = APP_REDRAW_NONE;
-    if (s_scan_pending) { s_pressed_control = -1; return true; }
+    if (shelf_waiting_for_index()) { s_pressed_control = -1; return true; }
     if (ev->type == UI_GESTURE_PRESS) {
         s_pressed_control = start < 0 ? -1 : 116 + start;
         if (start >= 0) {
-#if KIIKO_BOARD_METALIO47
-            (void)metalio_haptic_click();
-#endif
-            *redraw = shelf_key_paint(ctx);
         }
         return true;
     }
@@ -1586,7 +1755,6 @@ static bool shelf_pager_event(app_ctx_t *ctx, const ui_gesture_event_t *ev, app_
         *redraw = shelf_turn_page(ctx, target - ctx->leaf);
         if (*redraw != APP_REDRAW_NONE) return true;
     }
-    if (decorated) *redraw = shelf_key_paint(ctx);
     return true;
 }
 static EpdRect import_rect(int index) { return (EpdRect){36, 214 + index * 150, 612, 126}; }
@@ -1648,7 +1816,7 @@ static void reader_footer_strip_number(char *dst, size_t cap, const char *source
             if (*after == ' ' || *after == '\t' || *after == ':' || *after == '-') ++after;
             else after += strlen("：");
         }
-        name = after;
+        if (*after) name = after;
     }
     // 无名页不给占位名：底栏只留页码与全书进度。
     // Unnamed pages get no placeholder label; the footer keeps only page and book progress.
@@ -1656,17 +1824,10 @@ static void reader_footer_strip_number(char *dst, size_t cap, const char *source
     copy_text(dst, cap, name);
 }
 static size_t reader_page_offset(size_t page);
+#include "book_reader_chapter.inc"
 static void reader_footer_chapter_name(char *dst, size_t cap) {
-    char source[128] = {0};
-    size_t toc=s_selected_toc;
-    if(book_kind()==BOOK_KIND_TXT){size_t current=book_navigation_position(s_chapter,reader_page_offset(s_page));if(current!=SIZE_MAX)toc=current;}
-    bool selected = toc < book_navigation_count() &&
-        book_navigation_chapter(toc) == s_chapter &&
-        book_navigation_title(toc, source, sizeof(source)) == ESP_OK && source[0];
-    if (!selected) {
-        if (s_chapter_heading_title[0]) copy_text(source, sizeof(source), s_chapter_heading_title);
-        else if (book_chapter_title(s_chapter, source, sizeof(source)) != ESP_OK) source[0] = 0;
-    }
+    char source[128];
+    reader_current_chapter(source, sizeof(source));
     reader_footer_strip_number(dst, cap, source);
 }
 static uint32_t chapter_end(void) {
@@ -1679,12 +1840,19 @@ static size_t reader_page_offset(size_t page) {
         off = s_jump_offset;
     return off;
 }
+static size_t reader_saved_offset(size_t page) {
+    return s_part_base + reader_page_offset(page);
+}
 static unsigned percent(size_t page) {
     uint32_t total = book_total_bytes();
     if (!total) return 0;
-    if (s_chapter + 1 == book_chapter_count() && page + 1 == book_layout_page_count()) return 100;
+    if (!s_part_more && s_chapter + 1 == book_chapter_count() && page + 1 == book_layout_page_count()) return 100;
     uint32_t off = book_position_bytes(book_chapter_byte_offset(s_chapter), chapter_end(),
                                        reader_page_offset(page), s_text_len);
+    if (s_part_more || s_part_base) {
+        uint32_t start = book_chapter_byte_offset(s_chapter);
+        off = book_position_bytes(start + s_part_begin, start + s_part_end, reader_page_offset(page), s_text_len);
+    }
     return (unsigned)((uint64_t)off * 100 / total);
 }
 static pending_progress_t* pending_find(const char* path) {
@@ -2074,21 +2242,29 @@ static void draw_bulk_sort(uint8_t *fb) {
 static void save_progress(void) {
     if (!s_text || !s_path[0] || !book_layout_page_count()) return;
     bool was_failed = s_save_failed;
-    pending_progress_t* pending = pending_find(s_path);
-    if (!pending) { s_save_failed = true; return; }
     book_progress_t p = {
         .file_size = s_file_size, .chapter = (uint16_t)s_chapter,
-        .byte_off = (uint32_t)reader_page_offset(s_page),
+        .byte_off = (uint32_t)reader_saved_offset(s_page),
         .px = (uint8_t)s_px, .pct = (uint8_t)percent(s_page),
         .last_open_s = 0,
     };
+    char chapter[128];
+    reader_current_chapter(chapter, sizeof(chapter));
+    pending_progress_t *pending = pending_find(s_path);
+    if (!pending) {
+        s_save_failed = true;
+        book_ticket_note_position(s_path, &p, chapter, false);
+        return;
+    }
     if (!pending->dirty || pending->value.file_size != p.file_size || pending->value.chapter != p.chapter ||
         pending->value.byte_off != p.byte_off || pending->value.px != p.px || pending->value.pct != p.pct) {
         pending->value = p;
         pending->progress_saved = false;
     }
     pending->dirty = true;
-    if (pending_flush(pending)) {
+    const bool saved = pending_flush(pending);
+    book_ticket_note_position(s_path, &p, chapter, saved || pending->progress_saved);
+    if (saved) {
         s_unsaved = 0;
         s_save_failed = false;
         for (pending_progress_t* item = s_pending; item; item = item->next) if (item->dirty) s_save_failed = true;
@@ -2252,7 +2428,7 @@ static bool bookmark_load(reader_bookmarks_t* marks) {
 static bool bookmark_is_current(void) {
     reader_bookmarks_t marks;
     if (!bookmark_load(&marks)) return false;
-    size_t offset = book_layout_page_start_offset(s_page);
+    size_t offset = s_part_base + book_layout_page_start_offset(s_page);
     for (size_t i = 0; i < marks.count; ++i)
         if (marks.entries[i].chapter == s_chapter && marks.entries[i].byte_off == offset) return true;
     return false;
@@ -2319,7 +2495,7 @@ static bool bookmark_toggle(void) {
         marks.file_size = s_file_size;
         copy_text(marks.path, sizeof(marks.path), s_path);
     }
-    uint32_t offset = (uint32_t)book_layout_page_start_offset(s_page);
+    uint32_t offset = (uint32_t)(s_part_base + book_layout_page_start_offset(s_page));
     size_t found = marks.count;
     for (size_t i = 0; i < marks.count; ++i)
         if (marks.entries[i].chapter == s_chapter && marks.entries[i].byte_off == offset) { found = i; break; }
@@ -2742,6 +2918,9 @@ static EpdRect rule_span_rect(int index) {
 #pragma GCC push_options
 #pragma GCC optimize ("Os")
 #endif
+static EpdRect rule_save_rect(void) { return (EpdRect){36,1086,612,46}; }
+static EpdRect rule_back_rect(void) { return (EpdRect){36,1141,612,58}; }
+
 static void draw_rule_settings(uint8_t *fb) {
     const int top = 580;
     draw_sheet(fb, top, "阅读线");
@@ -2783,10 +2962,13 @@ static void draw_rule_settings(uint8_t *fb) {
         reader_panel_text_vc(fb, controls[i].x + controls[i].width / 2,
                    controls[i].y + controls[i].height / 2, 22, labels[i], EPD_DRAW_ALIGN_CENTER, false);
     }
-    if (!selected) ui_text_box(fb, (EpdRect){42, 1080, 600, 28}, 18, "选择虚线或点线后可调整位置", EPD_DRAW_ALIGN_LEFT, false);
-    EpdRect done = {36, 1113, 612, 72};
+    EpdRect save = rule_save_rect(), done = rule_back_rect();
+    ui_fill_round_rect(fb, save, 16, selected ? 0xe0 : 0xf0);
+    ui_draw_control_frame(fb, save, 16, selected ? 0x60 : 0xa0);
+    ui_text_box(fb, (EpdRect){save.x+10,save.y+4,save.width-20,save.height-8},
+                22, "保存阅读线格式", EPD_DRAW_ALIGN_CENTER, false);
     ui_fill_round_rect(fb, done, 20, UI_GRAY_BLACK);
-    reader_panel_text_vc(fb, 342, 1149, 23, "返回字体设置", EPD_DRAW_ALIGN_CENTER, true);
+    reader_panel_text_vc(fb, 342, 1170, 23, "返回排版", EPD_DRAW_ALIGN_CENTER, true);
 }
 #if defined(ESP_PLATFORM) && defined(__GNUC__) && !defined(__clang__)
 #pragma GCC pop_options
@@ -3174,7 +3356,7 @@ static void draw_reader_stats(uint8_t* fb) {
     epd_draw_line(64, top + 58, 73, top + 49, UI_GRAY_BLACK, fb);
     char values[3][32];
     snprintf(values[0], sizeof(values[0]), "%u%%", percent(s_page));
-    snprintf(values[1], sizeof(values[1]), "%lu 分钟", (unsigned long)(s_session_read_ms / 60000));
+    book_ticket_format_time(values[1], sizeof(values[1]), s_session_read_ms);
     snprintf(values[2], sizeof(values[2]), "%lu 次", (unsigned long)s_session_turns);
     const char* labels[] = {"阅读进度", "本次阅读", "翻页"};
     for (int i = 0; i < 3; ++i) {
@@ -3190,7 +3372,7 @@ static void draw_reader_stats(uint8_t* fb) {
     EpdRect fill = track; fill.width = fill.width * (int)percent(s_page) / 100;
     if (fill.width) ui_fill_round_rect(fb, fill, 6, 0x40);
     ui_hairline(fb, top + 276, 36, 612, 0xb0);
-    ui_text_box(fb,(EpdRect){54,top+292,190,38},23,"本章跳转",EPD_DRAW_ALIGN_LEFT,false);
+    ui_text_box(fb,(EpdRect){54,top+292,190,38},23,(s_part_more || s_part_base) ? "本段跳转" : "本章跳转",EPD_DRAW_ALIGN_LEFT,false);
     ui_text_box(fb,(EpdRect){258,top+292,372,38},19,s_title,EPD_DRAW_ALIGN_RIGHT,false);
     size_t count = book_layout_page_count();
     size_t draft = count ? (s_chapter_jump_page < count ? s_chapter_jump_page : count - 1) : 0;
@@ -3274,7 +3456,7 @@ static void draw_reader_bookmarks(uint8_t* fb) {
         int newest = (int)marks.count - 1 - (first + row);
         const reader_bookmark_entry_t* mark = &marks.entries[newest];
         EpdRect item = bookmark_row_rect(row);
-        bool current = mark->chapter == s_chapter && mark->byte_off == book_layout_page_start_offset(s_page);
+        bool current = mark->chapter == s_chapter && mark->byte_off == s_part_base + book_layout_page_start_offset(s_page);
         bool selected = s_bookmark_edit && (s_bookmark_selected & (UINT32_C(1) << newest));
         ui_fill_round_rect(fb, item, 14, selected ? 0xc0 : current ? 0xc8 : 0xe8);
         ui_draw_control_frame(fb, item, 14, current ? 0x50 : 0x98);
@@ -3282,7 +3464,7 @@ static void draw_reader_bookmarks(uint8_t* fb) {
         if (book_chapter_title(mark->chapter, chapter, sizeof(chapter)) != ESP_OK) chapter[0] = 0;
         char where[52];
         if (mark->chapter == s_chapter)
-            snprintf(where, sizeof(where), "第 %u 页", (unsigned)book_layout_page_for_offset(mark->byte_off) + 1);
+            snprintf(where, sizeof(where), "第 %u 页", (unsigned)book_layout_page_for_offset(mark->byte_off - s_part_base) + 1);
         else snprintf(where, sizeof(where), "章节 %u", (unsigned)mark->chapter + 1);
         int end=item.x+item.width-(s_bookmark_edit?70:20);
         int where_width=ui_text_fixed_width_px(ui_text_effective_px(20),where);
@@ -3429,71 +3611,19 @@ static void draw_reader_header(uint8_t *fb) {
     ui_draw_icon(fb,620,114,READER_TOOL_ICON_PX,UI_ICON_EXPAND,0x38);
     ui_hairline(fb,151,36,612,UI_GRAY_LIGHT);
 }
-// 竖排章节题头：右列是编号（第三章），左列是章名，读序依旧自右向左；两列整体留出列宽，
-// 排版用同一个宽度在首页右边缘预留，绘制与预留因此不会错位。
-// A vertical chapter heading: the number column (第三章) on the right and the title on the left,
-// still read right to left. Both columns reserve their width, and the layout reserves the same
-// width at the right edge of the first page, so drawing and reservation cannot drift apart.
-typedef struct {
-    int width;       ///< 首页右起需要预留的列宽 / columns to reserve at the first page's right
-    int title_px;    ///< 章名字号 / title type size
-    int title_x;     ///< 章名列左边缘 / title column's left edge
-    int label_px;    ///< 编号字号，无编号时为 0 / number size, 0 without a label
-    int label_x;     ///< 编号列左边缘 / label column's left edge
-    int text_height; ///< 较长一列的高度，用来垂直居中 / taller column, used to center
-} reader_heading_t;
-
-static reader_heading_t reader_heading_metrics(const char *title, const char *label, EpdRect body) {
-    reader_heading_t metrics = {0};
-    if (title == NULL || title[0] == 0 || body.height <= 0 || body.width <= 0) return metrics;
-    // 题头跟横排的题头一样走系统字体：正文换卡上字体不改变章节标题。
-    // The heading uses the system face exactly like the horizontal one, so swapping the body face
-    // never changes chapter titles.
-    ttf_font_select(TTF_FONT_SLOT_SYSTEM);
-    const int avail = body.height - 48;
-    int px = 48;
-    int need = ttf_vertical_text_height_px(px, title, 0);
-    // 一列放不下就缩字号；竖排的题头不折列，缩到 24 为止。
-    // Shrink the size when one column cannot hold the title; a vertical heading does not break
-    // into more columns and stops at 24.
-    if (need > avail && avail > 0) {
-        px = px * avail / need;
-        px &= ~3;
-        if (px < 24) px = 24;
-    }
-    int label_px = label != NULL && label[0] ? 24 : 0;
-    const int gap = 12;
-    metrics.title_px = px;
-    metrics.label_px = label_px;
-    metrics.width = px + (label_px ? label_px + gap : 0);
-    // 题头最多占正文带的三分之一，留够列给正文。
-    // A heading takes at most a third of the body band, leaving the rest for body columns.
-    if (metrics.width > body.width / 3) {
-        int scale = body.width / 3 * 100 / metrics.width;
-        metrics.title_px = metrics.title_px * scale / 100;
-        if (metrics.title_px < 24) metrics.title_px = 24;
-        metrics.label_px = label_px ? label_px * scale / 100 : 0;
-        if (metrics.label_px && metrics.label_px < 18) metrics.label_px = 18;
-        metrics.width = metrics.title_px + (metrics.label_px ? metrics.label_px + gap : 0);
-    }
-    const int right = body.x + body.width;
-    metrics.title_x = right - metrics.width;
-    metrics.label_x = right - metrics.label_px;
-    int title_h = ttf_vertical_text_height_px(metrics.title_px, title, 0);
-    int label_h = metrics.label_px ? ttf_vertical_text_height_px(metrics.label_px, label, 0) : 0;
-    metrics.text_height = title_h > label_h ? title_h : label_h;
-    return metrics;
-}
-
+// PICO 的两个 4 MiB 升级槽限制题头和设置页的代码体积。/ Keep heading and settings code within Pico's 4 MiB slots.
+#if defined(__XTENSA__) && defined(__GNUC__)
+#pragma GCC push_options
+#pragma GCC optimize("Os")
+#endif
+#include "apps/book_reader_heading.inc"
+#if defined(__XTENSA__) && defined(__GNUC__)
+#pragma GCC pop_options
+#endif
 static void draw_vertical_heading(uint8_t *fb, EpdRect body) {
     reader_heading_t metrics = reader_heading_metrics(s_chapter_heading_title, s_chapter_heading_label, body);
-    if (!metrics.width) return;
-    int y = body.y + (body.height - metrics.text_height) / 2;
-    if (y < body.y + 8) y = body.y + 8;
-    ttf_font_select(TTF_FONT_SLOT_SYSTEM);
-    if (metrics.label_px)
-        ttf_draw_text_px_vertical(fb, metrics.label_x, y, metrics.label_px, s_chapter_heading_label, 0, 0, 15);
-    ttf_draw_text_px_vertical(fb, metrics.title_x, y, metrics.title_px, s_chapter_heading_title, 0, 0, 15);
+    if (metrics.width)
+        draw_vertical_heading_style(fb, body, metrics, s_chapter_heading_title, s_chapter_heading_label);
 }
 
 // 重排前把章节题头的几何重新说给排版：竖排留右侧列宽、横排留顶部行高，
@@ -3511,7 +3641,15 @@ static void draw_vertical_heading(uint8_t *fb, EpdRect body) {
 // horizontally. `height` arrives already decided by the caller (zero when the first block is an
 // illustration or no title is usable); deriving it here unconditionally brought a heading onto
 // sheets that should have none, leaving it side by side with the body's own copy.
-static void apply_chapter_lead(const char *title, const char *label, size_t skip, unsigned height) {
+static void apply_chapter_lead_at_size(const char *title, const char *label, size_t skip,
+                                       unsigned height, unsigned size) {
+    reader_heading_viewport();
+    s_heading_layout_size = size;
+    const bool vertical = app_settings_book_vertical();
+    const int band = reader_heading_band_height(size);
+    book_layout_set_heading_extent(vertical ? 2 * reader_heading_column_px(size) + 28 : band);
+    book_layout_set_heading_measure(measure_reader_flow_heading);
+    book_layout_set_reader_spacing(true);
     s_chapter_lead_skip = skip;
     if (book_kind() != BOOK_KIND_EPUB || title == NULL || title[0] == 0 || !height) {
         s_chapter_lead_height = s_chapter_lead_width = 0;
@@ -3519,16 +3657,15 @@ static void apply_chapter_lead(const char *title, const char *label, size_t skip
         book_layout_set_chapter_lead_width(0);
         return;
     }
-    if (app_settings_book_vertical()) {
-        // 量竖排题头会光栅化字形，调用方须已持有绘制锁。
-        // Measuring the vertical heading rasterizes glyphs; the caller must hold the draw lock.
+    if (vertical) {
         s_chapter_lead_height = 0;
-        s_chapter_lead_width = (unsigned)reader_heading_metrics(title, label, body_rect()).width;
+        s_chapter_lead_width = (unsigned)reader_heading_metrics_at_size(title, label, body_rect(), size).width;
         book_layout_set_chapter_lead(skip, 0);
         book_layout_set_chapter_lead_width(s_chapter_lead_width);
     } else {
         s_chapter_lead_width = 0;
-        s_chapter_lead_height = height;
+        s_chapter_lead_height = (unsigned)horizontal_heading_at_size(NULL, body_rect(), title, label,
+            app_settings_book_heading_style(), app_settings_book_heading_align(), size);
         book_layout_set_chapter_lead(skip, s_chapter_lead_height);
         book_layout_set_chapter_lead_width(0);
     }
@@ -3539,6 +3676,10 @@ static void apply_chapter_lead(const char *title, const char *label, size_t skip
 // Hand the heading geometry to the layout before a re-layout; the caller holds the draw lock.
 // Every body re-layout needs this line, otherwise a mode or size change reserves room for the
 // previous heading and the heading lands on the body.
+static void apply_chapter_lead(const char *title, const char *label, size_t skip, unsigned height) {
+    apply_chapter_lead_at_size(title, label, skip, height, app_settings_book_heading_size());
+}
+
 static void refresh_chapter_lead(void) {
     apply_chapter_lead(s_chapter_heading_title, s_chapter_heading_label, s_chapter_lead_skip,
                        s_chapter_lead_row_height);
@@ -4029,6 +4170,7 @@ static void draw_reader_footnote_card(uint8_t *fb, size_t page, EpdRect body) {
     }
 }
 static void draw_reader_images(uint8_t *fb, size_t page, EpdRect body) {
+    (void)body;
     // 位图和布局代次必须匹配；预渲染另一页不能复用当前页插图。
     // Match page and layout generation; a prefetched page must never borrow current-page bitmaps.
     if (!app_settings_reader_hide_images() && page == s_page &&
@@ -4087,19 +4229,35 @@ static void draw_reader_images(uint8_t *fb, size_t page, EpdRect body) {
             } else if (height >= UI_PX_CAPTION + 4 && width >= 70) {
                 char notice[64]; copy_text(notice, sizeof(notice), "此插图暂无法显示");
                 fit_text(notice, UI_PX_CAPTION, width - 8);
-                ui_text_vc(fb, body.x + body.width / 2, body.y + y + height / 2,
+                int left = raw_x >= 0 ? raw_x : band.x + (band.width - width) / 2;
+                int top = y ? band.y + y : reader_image_top();
+                ui_text_vc(fb, left + width / 2, top + height / 2,
                            UI_PX_CAPTION, notice, EPD_DRAW_ALIGN_CENTER, false);
             }
         }
     }
 }
 static void reader_footer_progress(char *text,size_t cap,size_t page) {
-    size_t total=book_chapter_count(),current=total?(s_chapter<total?s_chapter+1:total):0;
-    snprintf(text,cap,"%u/%u  %u%%",(unsigned)current,(unsigned)total,percent(page));
+    // 与本章跳转使用同一份分页；百分比仍表示全书进度。
+    // Use the same layout as the chapter jump; percentage still tracks the whole book.
+    const size_t pages = book_layout_page_count();
+    const unsigned current = pages ? (unsigned)(page < pages ? page + 1 : pages) : 0;
+    if (s_part_more || s_part_base) {
+        snprintf(text, cap, "%u/%u 段内  %u%%", current, (unsigned)pages, percent(page));
+        return;
+    }
+    snprintf(text,cap,"%u/%u  %u%%",current,(unsigned)pages,percent(page));
 }
 // 独立绘制信息栏，先清理预读帧中的旧字形；物理刷新仍由正文/空闲局刷各自控制。
 // Paint independent metadata over clean cached bounds; body and idle updates control their own physical scans.
-static void draw_reader_metadata(uint8_t *fb,size_t page) {
+// 全局失败队列还可能属于其他书或最近入口；底栏只提示当前书尚未落盘的位置。
+// Other books and the resume pointer have separate failures; warn only for this book's unsaved position.
+static bool reader_current_progress_unsaved(void) {
+    pending_progress_t *pending = pending_find(s_path);
+    return pending && pending->dirty && !pending->progress_saved;
+}
+static void draw_reader_footer(uint8_t *fb,size_t page) {
+    ui_text_set_system_scale(false);
     EpdRect footer=progress_rect();
     ui_fill_rect_fast(footer,UI_GRAY_WHITE,fb);
     ui_reader_background_paint(fb,footer,true);
@@ -4109,42 +4267,45 @@ static void draw_reader_metadata(uint8_t *fb,size_t page) {
         track.width=track.width*(int)percent(page)/100;
         if(track.width)ui_fill_round_rect(fb,track,1,UI_GRAY_BLACK);
     } else {
-        if (s_reader_fullscreen) {
-            ui_fill_rect_fast(ui_reader_header(),UI_GRAY_WHITE,fb);
-            draw_reader_header(fb);
-            ui_reader_background_paint(fb,ui_reader_header(),true);
-        }
         char chapter[128];reader_footer_chapter_name(chapter,sizeof(chapter));
         char progress[48];reader_footer_progress(progress,sizeof(progress),page);
-        char line[160];snprintf(line,sizeof(line),"%s%s",s_save_failed?"未保存 · ":"",chapter);
-        fit_fixed_text(line,UI_READER_FOOTER_TEXT_PX,620-ui_text_fixed_width_px(UI_READER_FOOTER_TEXT_PX,progress)-12);
-        ui_text_fixed_vc(fb,32,footer.y+UI_READER_FOOTER_TEXT_Y-1168,UI_READER_FOOTER_TEXT_PX,line,EPD_DRAW_ALIGN_LEFT,false);
+        fit_fixed_text(chapter,UI_READER_FOOTER_TEXT_PX,620-ui_text_fixed_width_px(UI_READER_FOOTER_TEXT_PX,progress)-12);
+        ui_text_fixed_vc(fb,32,footer.y+UI_READER_FOOTER_TEXT_Y-1168,UI_READER_FOOTER_TEXT_PX,chapter,EPD_DRAW_ALIGN_LEFT,false);
+        if (reader_current_progress_unsaved()) {
+            const int cy = footer.y + UI_READER_FOOTER_TEXT_Y - 1168;
+            ui_draw_control_frame(fb, (EpdRect){8,cy-8,16,16}, 5, UI_GRAY_BLACK);
+            ui_fill_rect_fast((EpdRect){15,cy-4,2,6}, UI_GRAY_BLACK, fb);
+            ui_fill_rect_fast((EpdRect){15,cy+4,2,2}, UI_GRAY_BLACK, fb);
+        }
         ui_text_fixed_vc(fb,652,footer.y+UI_READER_FOOTER_TEXT_Y-1168,UI_READER_FOOTER_TEXT_PX,progress,EPD_DRAW_ALIGN_RIGHT,false);
         EpdRect track=ui_reader_progress();track.y+=footer.y-1168;ui_fill_round_rect(fb,track,3,0x90);
         track.width=track.width*(int)percent(page)/100;
         if(track.width)ui_fill_round_rect(fb,track,3,UI_GRAY_BLACK);
     }
 }
+static void draw_reader_metadata(uint8_t *fb, size_t page) {
+    if (s_reader_fullscreen && !app_settings_reader_immersive()) {
+        ui_fill_rect_fast(ui_reader_header(), UI_GRAY_WHITE, fb);
+        draw_reader_header(fb);
+        ui_reader_background_paint(fb, ui_reader_header(), true);
+    }
+    draw_reader_footer(fb, page);
+}
 static void draw_reader_outer(uint8_t *fb,size_t page) {
     ui_text_set_system_scale(false);
     EpdRect body=body_rect();
     if (page == 0 && s_chapter_heading_title[0] &&
         (s_chapter_lead_height || s_chapter_lead_width)) {
+        EpdRect heading = body;
+        heading.y += book_layout_page_top_padding(page);
+        heading.height = book_layout_page_content_height(page);
         if (app_settings_book_vertical()) {
             // 竖排题头站在首页预留的那条列里，正文从它左边接着排。
             // The vertical heading stands in the columns the first page reserved; the body
             // continues to its left.
-            draw_vertical_heading(fb, body);
+            draw_vertical_heading(fb, heading);
         } else {
-            char heading[128]; copy_text(heading, sizeof(heading), s_chapter_heading_title);
-            int heading_px = ui_text_title_fit(heading, 48, ui_content_width(), s_chapter_heading_title);
-            char label[sizeof(s_chapter_heading_label)]; copy_text(label, sizeof(label), s_chapter_heading_label);
-            int label_px = ui_text_title_fit(label, 24, ui_content_width(), s_chapter_heading_label);
-            ui_text_title_vc(fb, UI_LOCK_WIDTH / 2, body.y + 29, label_px, label,
-                              s_chapter_heading_label, EPD_DRAW_ALIGN_CENTER);
-            ui_text_title_vc(fb, UI_LOCK_WIDTH / 2, body.y + 112, heading_px, heading,
-                              s_chapter_heading_title, EPD_DRAW_ALIGN_CENTER);
-            ui_hairline(fb, body.y + 174, 210, 264, UI_GRAY_LIGHT);
+            draw_horizontal_heading(fb, heading);
         }
     }
     if (s_reader_panel != READER_PANEL_BACKGROUND_PREVIEW)
@@ -4277,6 +4438,7 @@ static void render(app_ctx_t* ctx, uint8_t* fb) {
     if (s_view == EDIT) { draw_editor(fb); unlock_draw(); return; }
     if (s_view == SEARCH) { draw_search(fb); unlock_draw(); return; }
     if (s_view == IMPORT) { draw_import(fb); unlock_draw(); return; }
+    if (s_view == COVER_LOOKUP) { draw_cover_lookup(fb); unlock_draw(); return; }
     if (s_view == BULK) { draw_bulk(fb, ctx->leaf); unlock_draw(); return; }
     if (s_view == MANAGE) {
         ui_clear_page(fb);
@@ -4339,18 +4501,61 @@ static void render(app_ctx_t* ctx, uint8_t* fb) {
     if(s_sort_menu)draw_shelf_sort_menu(fb);
     unlock_draw();
 }
-// 连续翻页合并信息栏，停下800ms后仅提交底部差分；书名只在进入/界面变化时更新。
-// Coalesce metadata during turns; after800ms idle submit only footer differences. The title stays outside body scans.
+// 页脚只提交真正变化的像素外接区域；进度不变时不扫空白行。/ Present the exact changed bounds of the footer; skip identical content.
+static EpdRect reader_footer_dirty(EpdiyHighlevelState *hl) {
+    if (!hl || !hl->front_fb || !hl->back_fb) return (EpdRect){0};
+    const EpdRect footer = progress_rect();
+    const EpdRect physical = ui_rotate_rect_to_fb(footer);
+    const size_t stride = (size_t)epd_width() / 2;
+    int left = physical.x + physical.width, right = physical.x;
+    int top = physical.y + physical.height, bottom = physical.y;
+    for (int y = physical.y; y < physical.y + physical.height; ++y) {
+        const size_t row = (size_t)y * stride;
+        for (int x = physical.x; x < physical.x + physical.width; ++x) {
+            const unsigned shift = (unsigned)(x & 1) * 4;
+            if (!(((hl->front_fb[row + x / 2] ^ hl->back_fb[row + x / 2]) >> shift) & 15)) continue;
+            if (x < left) left = x;
+            if (x >= right) right = x + 1;
+            if (y < top) top = y;
+            if (y >= bottom) bottom = y + 1;
+        }
+    }
+    if (left >= right || top >= bottom) return (EpdRect){0};
+    switch (epd_get_rotation()) {
+        case EPD_ROT_PORTRAIT: return (EpdRect){top, epd_width() - right, bottom - top, right - left};
+        case EPD_ROT_INVERTED_LANDSCAPE: return (EpdRect){epd_width() - right, epd_height() - bottom,
+                                                        right - left, bottom - top};
+        case EPD_ROT_INVERTED_PORTRAIT: return (EpdRect){epd_height() - bottom, left, bottom - top, right - left};
+        default: return (EpdRect){left, top, right - left, bottom - top};
+    }
+}
+// 按当前页重绘页脚，并用真实后缓冲决定局刷范围。/ Repaint the current footer and diff it against the physical history.
+static bool present_reader_footer(app_ctx_t *ctx) {
+    lock_draw();
+    draw_reader_footer(ctx->fb, s_page);
+    unlock_draw();
+    const EpdRect dirty = reader_footer_dirty(ctx->hl);
+    if (!dirty.width || !dirty.height) {
+        s_reader_footer_pending = false;
+        return false;
+    }
+    enum EpdDrawError result = update_display_reader_area(ctx->hl, &E0470_FOLLOW_WAVEFORM,
+                                                         MODE_DU, dirty, false);
+    guard_draw_result(ctx->hl, result);
+    s_reader_footer_pending = result != EPD_DRAW_SUCCESS;
+    if (s_reader_footer_pending) s_reader_footer_due_ms = esp_timer_get_time() / 1000 + 150;
+    return true;
+}
+
 static app_redraw_t reader_metadata_tick(app_ctx_t *ctx) {
-    if(s_view!=READING||!s_text){s_reader_footer_pending=false;return APP_REDRAW_NONE;}
-    if(!s_reader_footer_pending||s_reader_panel!=READER_PANEL_NONE||s_toolbar||s_clear_confirm||
-       ctx->consumed||ctx->request_app||ctx->request_return||ctx->request_menu||
-       (ctx->touch&&ctx->touch->touched)||ctx->now_ms<s_reader_footer_due_ms)return APP_REDRAW_NONE;
-    enum EpdDrawError err=reader_present_crop(ctx->hl,&E0470_FOLLOW_WAVEFORM,MODE_DU,progress_rect(),false);
-    guard_draw_result(ctx->hl,err);
-    if(err==EPD_DRAW_SUCCESS)s_reader_footer_pending=false;
-    else s_reader_footer_due_ms=ctx->now_ms+800;
-    return APP_REDRAW_DONE;
+    if (s_view != READING || !s_text) {
+        s_reader_footer_pending = false;
+        return APP_REDRAW_NONE;
+    }
+    if (!s_reader_footer_pending || s_reader_panel != READER_PANEL_NONE || s_toolbar || s_clear_confirm ||
+        ctx->consumed || ctx->request_app || ctx->request_return || ctx->request_menu ||
+        (ctx->touch && ctx->touch->touched) || ctx->now_ms < s_reader_footer_due_ms) return APP_REDRAW_NONE;
+    return present_reader_footer(ctx) ? APP_REDRAW_DONE : APP_REDRAW_NONE;
 }
 static EpdRect reader_status_area(void) { return (EpdRect){0,0,UI_LOCK_WIDTH,80}; }
 bool app_book_status_bar_visible(void){return s_view!=READING||(s_reader_panel!=READER_PANEL_TOUCH_SETTINGS&&s_reader_panel!=READER_PANEL_TOUCH_MORE);}
@@ -4374,6 +4579,11 @@ static app_redraw_t reader_clock_tick(app_ctx_t *ctx) {
     s_reader_clock_pending=true;
     return APP_REDRAW_AREA;
 }
+// Keep the renderer dispatch within Pico's existing 4 MiB application partition.
+#if defined(__XTENSA__) && defined(__GNUC__)
+#pragma GCC push_options
+#pragma GCC optimize("Os")
+#endif
 static bool present(app_ctx_t* ctx, app_redraw_t redraw) {
     bool rc_full=s_view==READING&&(s_reader_panel==READER_PANEL_TOUCH_SETTINGS||s_reader_panel==READER_PANEL_TOUCH_MORE);
     bool rc_transition=rc_full||s_rc_full_was_visible;s_rc_full_was_visible=rc_full;
@@ -4426,7 +4636,6 @@ static bool present(app_ctx_t* ctx, app_redraw_t redraw) {
     if ((s_view == SHELF || s_view == MANAGE || s_view == BULK) &&
         !(redraw == APP_REDRAW_AREA && (s_shelf_feedback_pending || s_cover_batch_present_pending))) {
         prepare_covers(ctx);
-        gather_cover_entry(ctx);
     }
     if (ctx->request_app) return true;
     if (s_view == READING && s_text) {
@@ -4441,7 +4650,8 @@ static bool present(app_ctx_t* ctx, app_redraw_t redraw) {
     int64_t drawn = esp_timer_get_time();
     // 本地细点阵挡板已是黑白目标，不注册灰区，省去暂存和第二轮GL16。
     // Local fine-dot guards are already BW targets; omit gray bands to skip staging and the second GL16 pass.
-    if (s_view == SHELF && s_shelf_page_pending) display_main_transition_shelf_page();
+    const bool shelf_page_turn = s_view == SHELF && s_shelf_page_pending;
+    if (shelf_page_turn) display_main_transition_shelf_page();
     s_shelf_page_pending = false;
     enum EpdDrawError err;
     bool image_gray_refresh = s_reader_image_refresh_pending && s_view == READING &&
@@ -4449,33 +4659,35 @@ static bool present(app_ctx_t* ctx, app_redraw_t redraw) {
     const bool reader_entry=s_view==READING&&s_text&&s_presented_view!=(int)READING;
     const EpdRect body_area=reader_area();
     const bool separate_metadata=s_view==READING&&s_text&&
-        s_reader_panel==READER_PANEL_NONE&&!s_toolbar&&!s_clear_confirm&&!s_reader_cleanup&&
+        s_reader_panel==READER_PANEL_NONE&&!s_toolbar&&!s_clear_confirm&&
         !reader_entry&&redraw==APP_REDRAW_AREA&&s_area.x==body_area.x&&s_area.y==body_area.y&&
         s_area.width==body_area.width&&s_area.height==body_area.height;
-    // 入书和从目录返回正文时先用目标页一次完整清理，覆盖图片/背景，不追加擦白或补刷。
-    // Clean reader entry and TOC returns in one complete target-page output, including images/backgrounds, without white prepasses or replay.
-    if(reader_entry)
-        err=update_display_area_full_with(ctx->hl,&E0470_FULL_WAVEFORM,MODE_GC16,
-                                         (EpdRect){0,0,UI_LOCK_WIDTH,UI_LOCK_HEIGHT});
-    else
-    if (image_gray_refresh && redraw == APP_REDRAW_AREA && !s_reader_cleanup && s_presented_view == (int)READING) {
+    // 从书架打开直接全刷一次黑白目标帧。/ Present the shelf entry as one full binary frame.
+    if (reader_entry) {
+        const EpdRect frame = {0,0,UI_LOCK_WIDTH,UI_LOCK_HEIGHT};
+        if (s_presented_view == SHELF || s_presented_view == BULK) ui_image_bw_rect(ctx->fb, frame);
+        err = update_display_area_full_with(ctx->hl, &E0470_FULL_WAVEFORM, MODE_GC16, frame);
+    } else if (image_gray_refresh && redraw == APP_REDRAW_AREA && !s_reader_cleanup && s_presented_view == (int)READING) {
         // 图文翻页只擦白内容区；界面操作仍可提交完整目标页。/ Image turns erase content only; UI changes retain complete target-page output.
-        err=update_display_area_full_with(ctx->hl,display_reader_soft_turn_waveform(),MODE_GL16,
-                                         separate_metadata?body_area:(EpdRect){0,0,UI_LOCK_WIDTH,UI_LOCK_HEIGHT});
+        const EpdWaveform *wave = display_reader_soft_turn_waveform();
+        err = separate_metadata ? update_display_reader_area(ctx->hl, wave, MODE_GL16, body_area, true)
+            : update_display_area_full_with(ctx->hl, wave, MODE_GL16, (EpdRect){0,0,UI_LOCK_WIDTH,UI_LOCK_HEIGHT});
     }
-    else if (image_gray_refresh) {
+    else if (image_gray_refresh && !s_reader_cleanup) {
         // 图片页整页重绘同样只推变化像素；KEY2 等显式全刷仍走完整 GC16。
         // Whole-page image repaints also drive changed pixels only; explicit full refreshes still run
         // the complete GC16.
-        err = redraw != APP_REDRAW_FULL && !s_reader_cleanup
+        err = redraw != APP_REDRAW_FULL
             ? update_display_area_full_with(ctx->hl, display_reader_soft_turn_waveform(), MODE_GL16,
                                             (EpdRect){0,0,UI_LOCK_WIDTH,UI_LOCK_HEIGHT})
             : update_display_with(ctx->hl, &E0470_FULL_WAVEFORM, MODE_GC16);
     }
     else if (s_reader_cleanup && redraw != APP_REDRAW_FULL)
-        // 周期清理使用完整原厂灰阶定稿，保留饱和驱动；一次输出，不叠加擦白或文字补刷。
-        // Periodic cleanup retains the complete vendor settling/saturation phases in one output, without erase or text replay.
-        err = update_display_area_full_with(ctx->hl, &E0470_FULL_WAVEFORM, MODE_GC16,
+        // 周期清理覆盖正文，页脚走独立差分；手动全刷仍覆盖整屏。
+        // Periodic cleanup covers the body and leaves the footer to its own differential update.
+        err = separate_metadata
+            ? update_display_reader_area(ctx->hl, &E0470_FULL_WAVEFORM, MODE_GC16, body_area, true)
+            : update_display_area_full_with(ctx->hl, &E0470_FULL_WAVEFORM, MODE_GC16,
                                             (EpdRect){0, 0, UI_LOCK_WIDTH, UI_LOCK_HEIGHT});
     else if (redraw == APP_REDRAW_FULL) err = update_display_full(ctx->hl);
     else if (redraw == APP_REDRAW_AREA && s_view == SHELF && s_shelf_feedback_pending) {
@@ -4492,21 +4704,40 @@ static bool present(app_ctx_t* ctx, app_redraw_t redraw) {
         // 翻页动画与页脚刷新独立：全屏没有页脚，仍使用用户选择的水波纹。
         // The turn effect is independent of the footer: full-screen turns still use the selected water effect.
         EpdRect turn_area=s_area;
-        err = s_water_turn_pending
-            ? update_display_water_turn(ctx->hl, turn_area, s_water_turn_dir)
-            : s_reader_turn_pending && s_mode == MODE_GL16 && app_settings_reader_turn_effect() == 2 &&
-              s_view == READING && s_presented_view == (int)READING &&
-              s_reader_panel == READER_PANEL_NONE && !s_toolbar && !s_clear_confirm &&
-              !book_layout_page_image_count(s_page) && !app_settings_book_background_path()[0]
-                ? update_display_text_turn(ctx->hl, turn_area, E0470_TURN_RTL)
-            // 普通翻页沿用正文GL16，和水波纹/速读共用内容范围；信息栏独立局刷。
-            // Ordinary turns retain body GL16 with the ripple/Fast BW content extent; metadata updates independently.
-            : s_reader_turn_pending && s_mode == MODE_GL16
-                ? update_display_area_full_with(ctx->hl,display_reader_soft_turn_waveform(),s_mode,
-                                                turn_area)
-                : update_display_area_diff_with(ctx->hl,
-                    s_mode == MODE_DU ? &E0470_FOLLOW_WAVEFORM : display_reader_soft_turn_waveform(),
-                    s_mode, s_area);
+        bool whole_panel = false;
+        if (s_water_turn_pending) {
+            err = update_display_water_turn(ctx->hl, turn_area, s_water_turn_dir);
+        } else if (s_reader_turn_pending && s_mode == MODE_GL16 && app_settings_reader_turn_effect() == 2 &&
+                   s_view == READING && s_presented_view == (int)READING &&
+                   s_reader_panel == READER_PANEL_NONE && !s_toolbar && !s_clear_confirm &&
+                   !book_layout_page_image_count(s_page) && !app_settings_book_background_path()[0]) {
+            err = update_display_text_turn(ctx->hl, turn_area, E0470_TURN_RTL);
+        } else if (s_reader_turn_pending && s_mode == MODE_GL16) {
+            // 普通翻页整屏推白并重推黑，状态栏和页脚也一起擦，避免阳光下淡墨。
+            // Ordinary turns push white and re-drive black across the whole panel, metadata included,
+            // so nothing stays faint in sunlight.
+            err = update_display_reader_area(ctx->hl, display_reader_soft_turn_waveform(), s_mode,
+                                             (EpdRect){0, 0, UI_LOCK_WIDTH, UI_LOCK_HEIGHT}, true);
+            whole_panel = true;
+        } else if (separate_metadata) {
+            err = update_display_reader_area(ctx->hl,
+                s_mode == MODE_DU ? &E0470_FOLLOW_WAVEFORM : display_reader_soft_turn_waveform(),
+                s_mode, turn_area, false);
+        } else {
+            err = update_display_area_diff_with(ctx->hl,
+                s_mode == MODE_DU ? &E0470_FOLLOW_WAVEFORM : display_reader_soft_turn_waveform(),
+                s_mode, s_area);
+        }
+        // 每次翻页只把状态栏和进度条的白色底再退一次白，未变化的文字/图形保持不动。
+        // Every turn only re-whitens the white background of the status row and progress bar;
+        // unchanged text and graphics are held.
+        if ((s_water_turn_pending || s_reader_turn_pending) && !whole_panel &&
+            err == EPD_DRAW_SUCCESS && s_view == READING) {
+            const EpdWaveform *meta_wave = display_reader_white_push_waveform();
+            err = update_display_area_full_with(ctx->hl, meta_wave, MODE_GL16, reader_status_area());
+            if (err == EPD_DRAW_SUCCESS)
+                err = update_display_area_full_with(ctx->hl, meta_wave, MODE_GL16, progress_rect());
+        }
         if (s_water_turn_pending) e0470_page_turn_set_tick_us(prior_tick);
     }
     else err = s_view == READING
@@ -4517,6 +4748,10 @@ static bool present(app_ctx_t* ctx, app_redraw_t redraw) {
         : update_display_fast_page(ctx->hl);
     int64_t displayed = esp_timer_get_time();
     reader_prefetch_end(prep);
+    if (s_txt_opening && s_view == READING && err == EPD_DRAW_SUCCESS) {
+        s_txt_opening = false;
+        pico_boot_book_end(true);
+    }
     if (redraw == APP_REDRAW_AREA && s_mode == MODE_DU &&
         !s_reader_cleanup && !image_gray_refresh && !s_shelf_feedback_pending) {
         s_du_area = s_du_count ? ui_rect_union(s_du_area, s_area) : s_area;
@@ -4527,7 +4762,7 @@ static bool present(app_ctx_t* ctx, app_redraw_t redraw) {
              (displayed - drawn) / 1000, (esp_timer_get_time() - displayed) / 1000);
     guard_draw_result(ctx->hl, err);
     if ((s_view==SHELF || s_view==MANAGE || s_view==BULK) && err==EPD_DRAW_SUCCESS) {
-        if ((redraw==APP_REDRAW_PAGE || redraw==APP_REDRAW_FULL) && shelf_cover_frame_ready()) s_cover_dirty_mask=0;
+        if ((redraw==APP_REDRAW_PAGE || redraw==APP_REDRAW_FULL || shelf_page_turn) && shelf_cover_frame_ready()) s_cover_dirty_mask=0;
         else if (s_cover_batch_present_pending) s_cover_dirty_mask &= ~s_cover_present_mask;
     }
     s_cover_present_mask=0;
@@ -4543,8 +4778,11 @@ static bool present(app_ctx_t* ctx, app_redraw_t redraw) {
         s_presented_view = (int)s_view;
         if(reader_entry)s_turns=0;
     }
-    s_reader_footer_pending=err==EPD_DRAW_SUCCESS&&separate_metadata;
-    if(s_reader_footer_pending)s_reader_footer_due_ms=esp_timer_get_time()/1000+800;
+    if (err == EPD_DRAW_SUCCESS) {
+        if (separate_metadata) (void)present_reader_footer(ctx);
+        else if (redraw == APP_REDRAW_PAGE || redraw == APP_REDRAW_FULL || reader_entry)
+            s_reader_footer_pending = false;
+    }
     s_water_turn_pending = false;
     s_shelf_feedback_pending = false;
     s_cover_batch_present_pending = false;
@@ -4552,6 +4790,9 @@ static bool present(app_ctx_t* ctx, app_redraw_t redraw) {
     s_mode = MODE_GL16;
     return true;
 }
+#if defined(__XTENSA__) && defined(__GNUC__)
+#pragma GCC pop_options
+#endif
 static app_redraw_t paint_reading(app_ctx_t* ctx, enum EpdDrawMode mode) {
     s_water_turn_pending = false;
     s_reader_turn_pending = false;
@@ -4575,7 +4816,7 @@ static app_redraw_t paint_reading(app_ctx_t* ctx, enum EpdDrawMode mode) {
     unlock_draw();
     ESP_LOGI(TAG, "paint cached=%d ms=%lld", cached, (esp_timer_get_time() - started) / 1000);
     s_area = reader_area();
-    s_reader_footer_pending = false; // 正文提交成功后安排独立空闲局刷。/ Queue independent idle metadata after a successful body scan.
+    s_reader_footer_pending = false; // 正文成功后提交当前页脚。/ Submit the current footer after a successful body scan.
     s_mode = mode;
     return APP_REDRAW_AREA;
 }
@@ -4613,27 +4854,13 @@ static bool reader_image_dims(void* ctx, int image, int* width, int* height) {
     if (height) *height = (int)h;
     return true;
 }
-static void flush_ticket_stats(void) {
-    uint32_t seconds = s_stats_pending_ms / 1000;
-    if (!seconds && !s_stats_pending_turns) return;
-    if (book_ticket_record(seconds, s_stats_pending_turns) == ESP_OK) {
-        s_stats_pending_ms -= seconds * 1000;
-        s_stats_pending_turns = 0;
-    }
-}
-static void track_ticket_stats(app_ctx_t* ctx) {
-    if (s_view != READING || !s_text) { s_stats_last_ms = ctx->now_ms; return; }
-    if (s_stats_last_ms > 0 && ctx->now_ms >= s_stats_last_ms &&
-        ctx->now_ms - s_stats_last_ms <= 5000 &&
-        ctx->now_ms - s_stats_activity_ms <= 300000 && !s_toolbar) {
-        uint32_t elapsed = (uint32_t)(ctx->now_ms - s_stats_last_ms);
-        s_stats_pending_ms += elapsed;
-        s_session_read_ms += elapsed;
-    }
-    s_stats_last_ms = ctx->now_ms;
-    if (s_stats_pending_ms >= 30000) flush_ticket_stats();
-}
+#include "book_ticket_reader.inc"
 static void free_book(void) {
+    s_reader_rule_pending = false;
+    if (s_txt_opening) {
+        s_txt_opening = false;
+        pico_boot_book_end(false);
+    }
     reader_font_recovery_reset();
     s_chapter_jump_undo.valid = false;
     s_chapter_jump_digits[0] = 0;
@@ -4669,6 +4896,8 @@ static void free_book(void) {
     book_layout_set_runs(NULL, 0);
     s_text = NULL;
     s_text_len = 0;
+    s_part_base = s_part_begin = s_part_end = 0;
+    s_part_more = false;
     s_selected_toc = SIZE_MAX;
     s_jump_offset = SIZE_MAX;
     book_close();
@@ -4734,7 +4963,6 @@ static void prepare_inline_image(void) {
     int count = reader_image_slots(s_page);
     if (changed_layout_or_image || count > 0) invalidate_prep();
     if (count > 0) release_image_headroom();
-    size_t psram_before = heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!count || count > (int)HTML_TEXT_MAX_BLOCKS) {
         ESP_LOGI(TAG, "inline page %u: %d image slots", (unsigned)s_page, count);
         return;
@@ -4748,6 +4976,7 @@ static void prepare_inline_image(void) {
         return;
     }
     s_page_image_count = count;
+    size_t psram_before = heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     // 逐张解码并立即释放压缩数据；全页灰阶位图的总面积不超过插图区域。
     // Decode serially and release each encoded buffer; the page's bitmap area stays within its
     // illustration region.
@@ -4792,7 +5021,7 @@ static void prepare_inline_image(void) {
                 continue;
             }
             if (book_image_grayscale(encoded, size, png, width, height, gray)) {
-                s_page_images[i] = (reader_image_t){gray, width, height};
+                s_page_images[i] = (reader_image_t){.gray=gray, .width=width, .height=height};
                 pixels_left -= pixels;
                 ++decoded;
             } else {
@@ -4814,34 +5043,13 @@ static void prepare_inline_image(void) {
                  (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) / 1024));
     }
 }
-// 标题匹配要宽松：书内导航与正文的写法常常不同（"第一章 出发" 对 "出发"、"1. Prologue" 对
-// "序章"，竖排书尤其如此）。逐字比较失败时正文标题块不会被跳过，题头与正文就各显示一次。
-// Heading matching has to be forgiving: an authored navigation title rarely matches the body text
-// verbatim ("Chapter 1 Departure" against "Departure", a numbered English title against its
-// Japanese one), and a strict compare leaves the body heading on the page, so it shows up twice.
-static bool heading_text_matches(const char *text, const char *toc, const char *heading,
-                                 const char *label) {
-    if (text == NULL || text[0] == 0) return false;
-    const char *candidates[3] = {toc, heading, label};
-    for (int i = 0; i < 3; ++i) {
-        const char *cand = candidates[i];
-        if (cand == NULL || cand[0] == 0) continue;
-        // 互相包含即视为同一标题；短于三个字节的候选不作为依据，免得误吞正文。
-        // Either containing the other counts as the same heading; candidates shorter than three
-        // bytes are ignored so ordinary body text cannot be swallowed.
-        if (strlen(cand) < 3) continue;
-        if (strstr(text, cand) != NULL || strstr(cand, text) != NULL) return true;
-    }
-    return false;
-}
-
 static bool load_chapter_at(app_ctx_t* ctx, size_t chapter, size_t offset,
                             bool last_page, const char *anchor, size_t source_offset) {
-    bool clear_toc = chapter != s_chapter || (!anchor && source_offset == SIZE_MAX);
+    bool clear_toc = chapter != s_chapter || (!anchor && source_offset == SIZE_MAX && !s_part_more && !s_part_base);
     html_text_t loaded = {0};
     size_t anchor_offset = 0;
-    esp_err_t err = book_chapter_load_blocks_target(chapter, anchor, source_offset,
-                                                    &anchor_offset, &loaded);
+    esp_err_t err = book_chapter_load_part(chapter, offset, last_page, anchor, source_offset,
+                                         &anchor_offset, &loaded);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "chapter load failed: %s", esp_err_to_name(err));
         copy_text(s_message, sizeof(s_message), "加载失败，请检查存储卡后重试");
@@ -4850,52 +5058,10 @@ static bool load_chapter_at(app_ctx_t* ctx, size_t chapter, size_t offset,
     char heading[128] = {0}, label[32] = {0}, toc_title[128] = {0};
     size_t lead_skip = 0;
     unsigned lead_height = 0;
-    if (book_kind() == BOOK_KIND_EPUB && loaded.len) {
-        // 已识别的正文编号题头优先；没有就不画题头，不用「第 N 节」占位。
-        // Prefer a recognized numbered body heading; without one no heading is drawn at all.
+    if (book_kind() == BOOK_KIND_EPUB && !loaded.source_begin && loaded.len && body_rect().height > 214) {
         if (book_chapter_title(chapter, toc_title, sizeof(toc_title)) != ESP_OK) toc_title[0] = 0;
-        copy_text(heading, sizeof(heading), toc_title);
-        char *chapter_mark = strstr(heading, "章");
-        if (chapter_mark && chapter_mark - heading < 24) {
-            char *after = chapter_mark + strlen("章");
-            while (*after == ' ' || *after == '\t' || *after == ':' || *after == '-' ||
-                   !strncmp(after, "：", strlen("：")) || !strncmp(after, "、", strlen("、"))) {
-                if (*after == ' ' || *after == '\t' || *after == ':' || *after == '-') ++after;
-                else after += strlen("：");
-            }
-            if (*after && (size_t)(chapter_mark + strlen("章") - heading) < sizeof(label)) {
-                size_t label_len = (size_t)(chapter_mark + strlen("章") - heading);
-                memcpy(label, heading, label_len); label[label_len] = 0;
-                memmove(heading, after, strlen(after) + 1);
-            }
-        }
-        size_t skip_blocks = 0;
-        // 最多看四个块：标题可能被拆成"第一章"、"出发"、"——副标题"这样几块。
-        // Up to four blocks: a heading can arrive split across several.
-        while (skip_blocks < loaded.count && skip_blocks < 4 &&
-               loaded.blocks[skip_blocks].heading && loaded.blocks[skip_blocks].image < 0) {
-            char body_heading[128] = {0};
-            size_t len = loaded.blocks[skip_blocks].len;
-            if (len >= sizeof(body_heading)) break;
-            memcpy(body_heading, loaded.utf8 + loaded.blocks[skip_blocks].offset, len);
-            while (len && (body_heading[len - 1] == ' ' || body_heading[len - 1] == '\t')) body_heading[--len] = 0;
-            const char *trimmed = body_heading;
-            while (*trimmed == ' ' || *trimmed == '\t') ++trimmed;
-            if (!heading_text_matches(trimmed, toc_title, heading, label)) break;
-            ++skip_blocks;
-        }
-        if (skip_blocks) lead_skip = skip_blocks < loaded.count ? loaded.blocks[skip_blocks].offset : loaded.len;
-        // 首块是插图时不预留题头：那页整页留给插图，标题在它后面才排。
-        // 这个条件一直是题头该不该出现的判据，横排竖排都一样。
-        // An illustration at the head of the chapter reserves nothing: it owns that page and the
-        // heading follows. This condition has always decided whether a sheet gets a heading at all,
-        // in either setting.
-        if (skip_blocks < loaded.count && loaded.blocks[skip_blocks].image >= 0) {
-            lead_skip = 0;
-            lead_height = 0;
-        } else {
-            lead_height = body_rect().height > 214 ? 214 : 0;
-        }
+        lead_skip = epub_chapter_lead(&loaded, toc_title, heading, sizeof(heading), label, sizeof(label));
+        if (heading[0]) lead_height = 214;
     }
     size_t old_lead_skip = s_chapter_lead_skip;
     unsigned old_lead_height = s_chapter_lead_height;
@@ -4909,6 +5075,7 @@ static bool load_chapter_at(app_ctx_t* ctx, size_t chapter, size_t offset,
     apply_chapter_lead(heading, label, lead_skip, lead_height);
     s_reader_dims_ctx = (reader_dims_ctx_t){chapter, loaded.images, loaded.image_count, loaded.notes, loaded.note_count};
     book_layout_set_image_dims(reader_image_dims, &s_reader_dims_ctx);
+    book_layout_set_heading_draw(draw_reader_flow_heading);
     book_layout_set_runs(loaded.runs, loaded.run_count);
     book_layout_set_inline_images(loaded.notes, loaded.note_count);
     bool ok = book_layout_build_blocks(loaded.utf8, loaded.len, loaded.blocks, loaded.count, body_rect(), s_px);
@@ -4940,7 +5107,7 @@ static bool load_chapter_at(app_ctx_t* ctx, size_t chapter, size_t offset,
         copy_text(s_message, sizeof(s_message), "排版失败：内存不足或章节过长");
         return false;
     }
-    book_excerpt_offer(s_path, chapter, &loaded);
+    if (!loaded.source_begin) book_excerpt_offer(s_path, chapter, &loaded);
     free(s_text);
     free(s_blocks);
     free(s_runs);
@@ -4948,6 +5115,10 @@ static bool load_chapter_at(app_ctx_t* ctx, size_t chapter, size_t offset,
     s_notes = loaded.notes; s_note_count = loaded.note_count; s_footnote_note = -1;
     s_text = loaded.utf8;
     s_text_len = loaded.len;
+    s_part_base = loaded.part_base;
+    s_part_begin = loaded.source_begin;
+    s_part_end = loaded.source_end;
+    s_part_more = loaded.part_more;
     s_blocks = loaded.blocks;
     s_block_count = loaded.count;
     s_runs = loaded.runs;
@@ -4964,7 +5135,7 @@ static bool load_chapter_at(app_ctx_t* ctx, size_t chapter, size_t offset,
     copy_text(s_chapter_heading_title, sizeof(s_chapter_heading_title), heading);
     copy_text(s_chapter_heading_label, sizeof(s_chapter_heading_label), label);
     s_page = last_page ? book_layout_page_count() - 1 :
-             book_layout_page_for_offset(anchor || source_offset != SIZE_MAX ? anchor_offset : offset);
+             book_layout_page_for_offset(anchor_offset);
     s_jump_offset = anchor || source_offset != SIZE_MAX ? anchor_offset : SIZE_MAX;
     s_jump_page = s_page;
     if (book_chapter_title(chapter, s_title, sizeof(s_title)) != ESP_OK) s_title[0] = 0;
@@ -4992,13 +5163,19 @@ static void skip_hidden_image_pages(app_ctx_t *ctx, int direction) {
     for (int guard = 0; guard < 128 && book_layout_page_image(s_page) >= 0; ++guard) {
         if (direction > 0 && s_page + 1 < book_layout_page_count()) ++s_page;
         else if (direction < 0 && s_page > 0) --s_page;
-        else if (direction > 0 && s_chapter + 1 < book_chapter_count()) {
+        else if (direction > 0 && s_part_more) {
+            if (!load_chapter(ctx, s_chapter, s_part_base + s_text_len + 1, false)) break;
+        } else if (direction < 0 && s_part_base) {
+            if (!load_chapter(ctx, s_chapter, s_part_base - 1, false)) break;
+        } else if (direction > 0 && s_chapter + 1 < book_chapter_count()) {
             if (!load_chapter(ctx, s_chapter + 1, 0, false)) break;
         } else if (direction < 0 && s_chapter > 0) {
             if (!load_chapter(ctx, s_chapter - 1, 0, true)) break;
         } else break;
     }
 }
+#include "apps/book_opening_notice.inc"
+
 static bool open_book_impl(app_ctx_t* ctx, const char* path) {
     if (!book_file_path_supported(path)) {
         copy_text(s_message, sizeof(s_message), "此版本仅支持 TXT 和 EPUB 书籍");
@@ -5034,6 +5211,7 @@ static bool open_book_impl(app_ctx_t* ctx, const char* path) {
     // 书架封面和上一本书的预渲染缓冲可以重建；先释放，再解析 EPUB。
     // Cover and previous-page caches are rebuildable; release them before EPUB parsing.
     book_shelf_page_release();
+    metalio_cover_cache_trim(512u * 1024u);
     invalidate_covers();
     app_home_release_clock_cache();
     lock_draw();
@@ -5066,26 +5244,29 @@ static bool open_book_impl(app_ctx_t* ctx, const char* path) {
     free_book();
     s_reader_fullscreen = s_requested_resume_mode ? s_requested_fullscreen : app_settings_reader_default_fullscreen();
     s_requested_resume_mode = false;
-    app_font_activate_reading();
     if (!pending_reserve(path)) {
         copy_text(s_message, sizeof(s_message), "内存不足，无法打开图书");
         app_font_activate_system();
         return false;
     }
     esp_err_t err = book_open(path);
+    // Free the imported system face for one retry if source indexing cannot allocate PSRAM.
+    if (err == ESP_ERR_NO_MEM && !ttf_font_is_builtin() && ttf_font_open_builtin() == ESP_OK)
+        err = book_open(path);
     // 书源打开后再把书内字体开关接上：EPUB 才有效，TXT 是空操作。
     // Wire the embedded-face switch only after the source is open: it only applies to EPUB,
     // and is a no-op for TXT.
     if (err == ESP_OK) {
         s_book_fonts_applied = app_settings_book_fonts();
         book_set_embedded_fonts(s_book_fonts_applied);
+        app_font_activate_reading();
     }
     if (err != ESP_OK) {
         pending_progress_t* pending = pending_find(path);
         if (pending && !pending->dirty) pending_discard(path);
         copy_text(s_message, sizeof(s_message),
                   err == ESP_ERR_NOT_SUPPORTED ? "文件格式或压缩方式暂不支持" :
-                  err == ESP_ERR_NO_MEM ? "内存不足，请重启后重试" :
+                  err == ESP_ERR_NO_MEM ? "内存不足，无法打开图书" :
                   err == ESP_ERR_INVALID_SIZE ? "图书资源过大或章节过多" :
                   "无法打开图书，请检查文件");
         ESP_LOGW(TAG, "open failed: %s internal=%u/%u psram=%u/%u", esp_err_to_name(err),
@@ -5098,10 +5279,10 @@ static bool open_book_impl(app_ctx_t* ctx, const char* path) {
     }
     copy_text(s_path, sizeof(s_path), path);
     s_reader_favorite = favorite_load(path);
-    const char* filename = strrchr(path, '/');
-    filename = filename ? filename + 1 : path;
-    if (!book_title_from_path(path, s_book_title, sizeof(s_book_title)))
-        clean_filename(s_book_title, sizeof(s_book_title), filename);
+    if (!book_display_name_from_path(path, s_book_title, sizeof(s_book_title), NULL, 0)) {
+        const char *base = strrchr(path, '/');
+        clean_filename(s_book_title, sizeof(s_book_title), base ? base + 1 : path);
+    }
     s_file_size = (uint32_t)st.st_size;
     book_progress_t p = {0};
     bool resume = pending_restore(path, s_file_size, &p) || book_progress_load(path, s_file_size, &p);
@@ -5119,7 +5300,7 @@ static bool open_book_impl(app_ctx_t* ctx, const char* path) {
     s_view = READING;
     s_reader_image_refresh_pending = !app_settings_reader_hide_images() &&
         book_layout_page_image_count(s_page) > 0 && s_page_images;
-    s_stats_last_ms = s_stats_activity_ms = ctx->now_ms;
+    s_stats_activity_ms = ctx->now_ms;
     s_reader_panel = READER_PANEL_NONE;
     s_clear_confirm = s_batch_confirm = false;
     s_session_read_ms = s_session_turns = 0;
@@ -5134,10 +5315,21 @@ static bool open_book_impl(app_ctx_t* ctx, const char* path) {
     ESP_LOGI(TAG, "opened kind=%d chapters=%u pages=%u px=%d", book_kind(), (unsigned)book_chapter_count(), (unsigned)book_layout_page_count(), s_px);
     return true;
 }
+// Keep the opening dispatch within Pico's 4 MiB application slot.
+#if defined(__XTENSA__) && defined(__GNUC__)
+#pragma GCC push_options
+#pragma GCC optimize("Os")
+#endif
 static bool open_book(app_ctx_t *ctx, const char *path) {
-    if (!book_cover_jobs_quiesce(2000)) {
-        copy_text(s_message,sizeof(s_message),"封面任务正在收尾，请稍后再试");return false;
+    show_book_opening(ctx);
+    if (s_txt_opening) {
+        s_txt_opening = false;
+        pico_boot_book_end(false);
     }
+    app_book_shelf_prefetch_cancel();
+    (void)book_cover_jobs_quiesce(0);
+    invalidate_covers();
+    book_progress_prepare();
     esp_err_t checkpoint_error=pico_boot_book_begin(path);
     if (checkpoint_error != ESP_OK) {
         ESP_LOGW("book", "open checkpoint failed: %s", esp_err_to_name(checkpoint_error));
@@ -5145,7 +5337,12 @@ static bool open_book(app_ctx_t *ctx, const char *path) {
         return false;
     }
     bool ok = open_book_impl(ctx, path);
-    pico_boot_book_end(ok);
+    if (ok && s_scan_pending) {
+        s_scan_pending = false;
+        s_shelf_recheck_on_return = true;
+    }
+    if (ok && shelf_is_txt(path)) s_txt_opening = true;
+    else pico_boot_book_end(ok);
     return ok;
 }
 static bool open_requested_book(app_ctx_t* ctx) {
@@ -5162,6 +5359,25 @@ static bool open_requested_book(app_ctx_t* ctx) {
     s_reader_return_home = from_home;
     return true;
 }
+// Keep EPUB parsing out of the already deep touch-dispatch stack.
+static app_redraw_t queue_shelf_open(const char *path) {
+    if (app_book_request_open(path)) {
+        s_shelf_open_queued = true;
+        return APP_REDRAW_NONE;
+    }
+    copy_text(s_message, sizeof(s_message), "无法打开图书，请检查文件");
+    return APP_REDRAW_PAGE;
+}
+
+static void cancel_shelf_open(void) {
+    if (!s_shelf_open_queued) return;
+    s_shelf_open_queued = false;
+    s_requested_open[0] = 0;
+}
+
+#if defined(__XTENSA__) && defined(__GNUC__)
+#pragma GCC pop_options
+#endif
 /* ---- 书架数据 / Shelf data ---- */
 static int shelf_category_add(const char *path) {
     for (int i=2;i<s_category_count;++i) {
@@ -5211,7 +5427,7 @@ static bool shelf_category_matches(const char *path) {
     return !strncmp(path,s_categories[s_category_selected].path,size) && path[size]=='/';
 }
 static void shelf_category_remember(app_ctx_t *ctx) {
-    if (s_categories && s_view==SHELF && !s_scan_pending)
+    if (s_categories && s_view==SHELF && !shelf_waiting_for_index())
         s_categories[s_category_selected].pages[shelf_display_style()==5]=ctx->leaf;
 }
 static void shelf_category_restore(app_ctx_t *ctx) {
@@ -5411,6 +5627,14 @@ typedef struct {
     DIR *dir;
     char path[BOOK_STORE_PATH_MAX];
 } shelf_scan_frame_t;
+static bool s_shelf_scan_yield_to_touch, s_shelf_scan_cancelled, s_background_index_scan;
+static bool shelf_scan_interrupted(app_ctx_t *ctx) {
+    if (s_view != SHELF) return false;
+    if (!s_background_index_scan && app_poll_main_navigation(ctx)) return true;
+    if (s_shelf_scan_yield_to_touch && app_touch_input_pending(ctx)) s_shelf_scan_cancelled = true;
+    return s_shelf_scan_cancelled;
+}
+
 static void scan_shelf_dir(app_ctx_t *ctx, const char *root, bool is_flash, nvs_handle_t favorites,
                            nvs_handle_t hidden, bool *truncated, bool *unreadable,
                            bool *skipped) {
@@ -5425,7 +5649,7 @@ static void scan_shelf_dir(app_ctx_t *ctx, const char *root, bool is_flash, nvs_
     memcpy(frames[0].path, root, root_len + 1);
     int depth = 0;
     while (depth >= 0 && !*truncated) {
-        if (s_view == SHELF && app_poll_main_navigation(ctx)) break;
+        if (shelf_scan_interrupted(ctx)) break;
         errno = 0;
         struct dirent *ent = readdir(frames[depth].dir);
         if (!ent) {
@@ -5468,6 +5692,8 @@ static void scan_shelf_dir(app_ctx_t *ctx, const char *root, bool is_flash, nvs_
         copy_text(item->path, sizeof(item->path), path);
         if (!book_name_from_path(item->path, item->name, sizeof(item->name),item->author,sizeof(item->author)))
             clean_filename(item->name, sizeof(item->name), ent->d_name);
+        (void)book_weread_cover_metadata(item->path, item->name, sizeof(item->name),
+                                         item->author, sizeof(item->author));
         if (!strcasecmp(ext, ".epub")) {
             char title[sizeof(item->name)] = {0};
             char author[sizeof(item->author)] = {0};
@@ -5482,6 +5708,8 @@ static void scan_shelf_dir(app_ctx_t *ctx, const char *root, bool is_flash, nvs_
         }
         item->search_match = read_pico_search_match(item->name, s_query);
         item->size = st.st_size;
+        item->modified = st.st_mtime;
+        item->cover_identity_known = true;
         item->chapters = 0;item->chapters_checked=false;
         item->is_flash = is_flash;
         // 扫完目录后批量读取进度。/ Read progress in bounded batches after directory enumeration.
@@ -5525,6 +5753,8 @@ static bool shelf_backfill_visit(const char* path, const book_progress_t* progre
     copy_text(item->path, sizeof(item->path), path);
     if (!book_name_from_path(item->path, item->name, sizeof(item->name),item->author,sizeof(item->author)))
         clean_filename(item->name, sizeof(item->name), base);
+    (void)book_weread_cover_metadata(item->path, item->name, sizeof(item->name),
+                                     item->author, sizeof(item->author));
     if (!item->name[0]) return true;
     const char* ext = strrchr(base, '.');
     if (ext && !strcasecmp(ext, ".epub") && pico_boot_asset_allowed(item->path)) {
@@ -5537,6 +5767,8 @@ static bool shelf_backfill_visit(const char* path, const book_progress_t* progre
         }
     }
     item->size = (uint32_t)st.st_size;
+    item->modified = st.st_mtime;
+    item->cover_identity_known = true;
     item->chapters = 0;item->chapters_checked=false;
     // 内置书根固定在 /flash 下，与 book_store.c 和 open_book 的前缀判断一致。
     // The internal root lives under /flash, matching the prefix test in book_store.c and open_book.
@@ -5576,7 +5808,7 @@ static bool shelf_progress_load(app_ctx_t *ctx) {
     if (!s_count) return true;
     book_progress_query_t *queries=heap_caps_calloc(BOOK_PROGRESS_BATCH_MAX,sizeof(*queries),MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
     for (int first=0;first<s_count;first+=BOOK_PROGRESS_BATCH_MAX) {
-        if (s_view==SHELF && app_poll_main_navigation(ctx)) { free(queries); return false; }
+        if (shelf_scan_interrupted(ctx)) { free(queries); return false; }
         size_t count=(size_t)(s_count-first);if(count>BOOK_PROGRESS_BATCH_MAX)count=BOOK_PROGRESS_BATCH_MAX;
         bool batched=false;
         if (queries) {
@@ -5607,10 +5839,274 @@ static void shelf_added_load(void) {
     book_added_load(items, (size_t)s_count);
     free(items);
 }
+/* ---- 书架位置索引缓存 / Shelf position index cache ---- */
+// 用户2026-11-05：书架缓存统一放 TF 根目录 .kiikoread；启动先读位置索引直接上屏，
+// 目录与封面在后台核对，不再每次开机逐本 stat/解析。图片缓存沿用 covers/ 下的成品点阵。
+// User2026-11-05: keep shelf caches under TF:/kiikoread. Boot loads the position index for the
+// first frame and reconciles the directory/covers in the background; the covers/ folder keeps
+// finished rasters so decoding never repeats.
+#define SHELF_CACHE_DIR "/sdcard/.kiikoread"
+#define SHELF_CACHE_PATH SHELF_CACHE_DIR "/shelf.idx"
+#define SHELF_CACHE_MAGIC UINT32_C(0x4B534853)
+#define SHELF_CACHE_VERSION 1u
+#define SHELF_CACHE_MAX_ENTRIES 4096
+typedef struct { uint32_t magic, version, count, checksum; } shelf_cache_header_t;
+typedef struct {
+    char path[BOOK_STORE_PATH_MAX];
+    char name[256];
+    char author[128];
+    uint32_t size, recent;
+    uint64_t added;
+    uint16_t chapter;
+    uint8_t pct, flags;
+} shelf_cache_entry_t;
+static uint32_t shelf_cache_hash(const void* data, size_t size) {
+    const uint8_t* p = data;
+    uint32_t hash = UINT32_C(2166136261);
+    while (size--) hash = (hash ^ *p++) * UINT32_C(16777619);
+    return hash;
+}
+static void shelf_cache_save(void) {
+    if (!s_count || s_count > SHELF_CACHE_MAX_ENTRIES) return;
+    if (mkdir(SHELF_CACHE_DIR, 0777) && errno != EEXIST) return;
+    char temp[64];
+    snprintf(temp, sizeof(temp), SHELF_CACHE_PATH ".tmp");
+    FILE* file = fopen(temp, "wb");
+    if (!file) return;
+    shelf_cache_header_t header = {.magic = SHELF_CACHE_MAGIC, .version = SHELF_CACHE_VERSION,
+                                   .count = (uint32_t)s_count, .checksum = 0};
+    bool ok = fwrite(&header, 1, sizeof(header), file) == sizeof(header);
+    uint32_t sum = 0;
+    for (int i = 0; ok && i < s_count; ++i) {
+        shelf_cache_entry_t e;
+        memset(&e, 0, sizeof(e));
+        copy_text(e.path, sizeof(e.path), s_shelf[i].path);
+        copy_text(e.name, sizeof(e.name), s_shelf[i].name);
+        copy_text(e.author, sizeof(e.author), s_shelf[i].author);
+        e.size = s_shelf[i].size;
+        e.recent = s_shelf[i].recent;
+        e.added = s_shelf[i].added;
+        e.chapter = s_shelf[i].chapter;
+        e.pct = s_shelf[i].pct;
+        e.flags = (uint8_t)((s_shelf[i].is_flash ? 1u : 0u) | (s_shelf[i].has_progress ? 2u : 0u) |
+                            (s_shelf[i].favorite ? 4u : 0u));
+        sum = (sum ^ shelf_cache_hash(&e, sizeof(e))) * UINT32_C(16777619);
+        ok = ok && fwrite(&e, 1, sizeof(e), file) == sizeof(e);
+    }
+    if (ok) {
+        header.checksum = sum;
+        ok = fseek(file, 0, SEEK_SET) == 0 && fwrite(&header, 1, sizeof(header), file) == sizeof(header);
+    }
+    if (fclose(file) != 0) ok = false;
+    if (!ok) { remove(temp); return; }
+    remove(SHELF_CACHE_PATH);
+    if (rename(temp, SHELF_CACHE_PATH) != 0) remove(temp);
+}
+static bool shelf_cache_load(app_ctx_t* ctx, bool background) {
+    FILE* file = fopen(SHELF_CACHE_PATH, "rb");
+    if (!file) return false;
+    shelf_cache_header_t header;
+    bool ok = fread(&header, 1, sizeof(header), file) == sizeof(header) &&
+              header.magic == SHELF_CACHE_MAGIC && header.version == SHELF_CACHE_VERSION &&
+              header.count <= SHELF_CACHE_MAX_ENTRIES;
+    uint32_t sum = 0;
+    bool stale = false;
+    int kept = 0;
+    if (ok) {
+        s_count = 0;
+        for (uint32_t i = 0; ok && i < header.count; ++i) {
+            if (background && !(i % 16) && app_touch_input_pending(ctx)) { ok = false; break; }
+            shelf_cache_entry_t e;
+            if (fread(&e, 1, sizeof(e), file) != sizeof(e)) { ok = false; break; }
+            sum = (sum ^ shelf_cache_hash(&e, sizeof(e))) * UINT32_C(16777619);
+            if (!memchr(e.path, 0, sizeof(e.path)) || !memchr(e.name, 0, sizeof(e.name)) ||
+                !memchr(e.author, 0, sizeof(e.author)) || !book_file_path_supported(e.path)) {
+                stale = true;
+                continue;
+            }
+            if (!shelf_reserve()) { ok = false; break; }
+            shelf_entry_t item;
+            memset(&item, 0, sizeof(item));
+            copy_text(item.path, sizeof(item.path), e.path);
+            copy_text(item.name, sizeof(item.name), e.name);
+            copy_text(item.author, sizeof(item.author), e.author);
+            item.size = e.size;
+            item.chapter = e.chapter;
+            item.pct = e.pct;
+            item.recent = e.recent;
+            item.added = e.added;
+            item.is_flash = (e.flags & 1u) != 0;
+            item.has_progress = (e.flags & 2u) != 0;
+            item.favorite = (e.flags & 4u) != 0;
+            item.search_match = read_pico_search_match(item.name, s_query);
+            s_shelf[s_count++] = item;
+            ++kept;
+        }
+    }
+    fclose(file);
+    if (!ok || (header.count && sum != header.checksum) || !kept) { s_count = 0; return false; }
+    if (!background) shelf_added_load();
+    shelf_categories_recount();
+    sort_shelf(ctx);
+    if (s_view == SHELF) shelf_category_restore(ctx);
+    s_latest_path[0] = 0;
+    char last[BOOK_STORE_PATH_MAX];
+    if (book_progress_last_path(last, sizeof(last))) {
+        for (int i = 0; i < s_count; ++i)
+            if (!strcmp(s_shelf[i].path, last) && !s_shelf[i].removed) {
+                copy_text(s_latest_path, sizeof(s_latest_path), last);
+                break;
+            }
+    }
+    read_pico_sd_info_t sd = {0};
+    (void)read_pico_sd_get_info(&sd);
+    s_cache_sd_present = sd.present;
+    s_cache_sd_mounted = sd.mounted;
+    s_cache_shelf_style = app_settings_shelf_style();
+    s_store_revision = book_store_revision();
+    s_progress_revision = book_progress_revision();
+    s_shelf_cache_valid = true;
+    s_shelf_index_preloaded = background;
+    ESP_LOGI(TAG, "shelf cache books=%d stale=%d", s_count, (int)stale);
+    return true;
+}
+
+void app_book_shelf_prefetch_cancel(void) {
+    if (s_first_page_warm.generation) {
+        for (int row = 0; row < BOOK_GRID_ROWS && row < s_visible_count && s_first_page_warm.pending; ++row) {
+            const unsigned bit = 1u << row;
+            if (!(s_first_page_warm.pending & bit)) continue;
+            (void)shelf_record_prefetch_result(s_first_page_warm.generation, row, row, false);
+        }
+        book_cover_jobs_cancel(s_first_page_warm.generation);
+        s_first_page_warm.generation = 0;
+        s_first_page_warm.pending = 0;
+    }
+}
+void app_book_shelf_prefetch_reset(void) {
+    app_book_shelf_prefetch_cancel();
+    ++s_shelf_catalog_epoch;
+    invalidate_covers();
+    s_first_page_warm.next_ms = 0;
+    s_shelf_cache_valid = false;
+    s_shelf_index_preloaded = false;
+    metalio_cover_cache_clear();
+}
+void app_book_shelf_prefetch_first(app_ctx_t *ctx) {
+    if (ctx->now_ms < s_first_page_warm.next_ms || pico_boot_recovery() || app_touch_input_pending(ctx)) return;
+    if (s_first_page_warm.generation) {
+        for (int row = 0; row < BOOK_GRID_ROWS; ++row) {
+            const unsigned bit = 1u << row;
+            if (!(s_first_page_warm.pending & bit)) continue;
+            if (shelf_record_prefetch_result(s_first_page_warm.generation, row, row, true))
+                s_first_page_warm.pending &= ~bit;
+        }
+        if (s_first_page_warm.pending) return;
+        app_book_shelf_prefetch_cancel();
+        s_first_page_warm.next_ms = ctx->now_ms + 2000;
+        return;
+    }
+    if (!book_cover_jobs_idle()) return;
+
+    read_pico_sd_info_t sd = {0};
+    if (read_pico_sd_get_info(&sd) == ESP_ERR_NOT_FINISHED) return;
+    shelf_category_init();
+    const unsigned order = app_settings_shelf_order();
+    const unsigned style = app_settings_shelf_style();
+    const bool same = s_shelf_cache_valid && s_store_revision == book_store_revision() &&
+        sd.present == s_cache_sd_present && sd.mounted == s_cache_sd_mounted;
+    app_ctx_t shelf_ctx = *ctx;
+    if (!same) {
+        s_shelf_cache_valid = false;
+        s_shelf_index_preloaded = false;
+        if (!sd.mounted || !read_pico_sd_io_ready()) {
+            s_first_page_warm.next_ms = ctx->now_ms + 1000;
+            return;
+        }
+        s_shelf_order = order;
+        s_recent_sort = order == 1 || order == 3;
+        if (shelf_cache_load(&shelf_ctx, true)) {
+            // 首次进书架时核对旧索引。/ Reconcile the restored catalog on first shelf entry.
+            s_shelf_recheck_on_return = true;
+        } else {
+            // 新卡可以在主页面建立索引，触摸到达时保留旧目录并退出。
+            // Build a catalog for a new card on an idle root, and roll back on input.
+            const book_view_t previous_view = s_view;
+            s_view = SHELF;
+            s_background_index_scan = true;
+            scan_shelf(&shelf_ctx);
+            s_background_index_scan = false;
+            s_view = previous_view;
+            if (!s_shelf_cache_valid) {
+                s_scan_pending = false;
+                s_first_page_warm.next_ms = ctx->now_ms + 3000;
+                return;
+            }
+            s_shelf_recheck_on_return = false;
+        }
+    } else {
+        if (s_shelf_order != order || s_cache_shelf_style != style) {
+            s_shelf_order = order;
+            s_recent_sort = order == 1 || order == 3;
+            s_cache_shelf_style = style;
+            sort_shelf(&shelf_ctx);
+        }
+        refresh_cached_progress(&shelf_ctx);
+    }
+    const book_view_t previous_view = s_view;
+    s_view = SHELF;
+    const int rows = shelf_rows();
+    const bool list = shelf_display_style() == 5;
+    for (int row = 0; row < rows && row < s_visible_count && !app_touch_input_pending(ctx); ++row) {
+        const shelf_entry_t *item = &s_shelf[row];
+        if (item->removed || !pico_boot_asset_allowed(item->path)) continue;
+        const bool raster_ready = shelf_cover_ram_hit(row, row, false);
+        if (raster_ready && (!list || item->chapters_checked)) continue;
+        if (!strncmp(item->path, "/sdcard/", 8) && !read_pico_sd_io_ready()) continue;
+        const EpdRect image = shelf_cover_image(row);
+        book_cover_job_t request = {
+            .list = list, .fast = app_settings_main_fast_refresh(), .artwork_only = !shelf_is_txt(item->path),
+            .metadata_only = raster_ready,
+            .with_chapters = list && !item->chapters_checked,
+            .width = image.width, .height = image.height, .stride = SHELF_FAST_COVER_STRIDE,
+            .contrast = app_settings_system_contrast(), .phase = (image.x & 3) | ((image.y & 3) << 2),
+            .x = image.x, .y = image.y,
+        };
+        copy_text(request.path, sizeof(request.path), item->path);
+        copy_text(request.title, sizeof(request.title), item->name);
+        copy_text(request.author, sizeof(request.author), item->author);
+        if (!s_first_page_warm.generation) s_first_page_warm.generation = book_cover_jobs_begin();
+        if (book_cover_jobs_submit(s_first_page_warm.generation, row, &request))
+            s_first_page_warm.pending |= 1u << row;
+    }
+    s_view = previous_view;
+    if (!s_first_page_warm.pending) {
+        app_book_shelf_prefetch_cancel();
+        s_first_page_warm.next_ms = ctx->now_ms + 2000;
+    }
+}
+
 static void scan_shelf(app_ctx_t* ctx) {
-    const int64_t scan_started=esp_timer_get_time();
     const uint32_t progress_revision=book_progress_revision();
     shelf_category_init();
+    shelf_entry_t *previous = s_shelf;
+    size_t previous_capacity = s_shelf_capacity;
+    int previous_count = s_count, previous_visible = s_visible_count;
+    const int previous_first = ctx->leaf * shelf_rows();
+    int previous_categories = s_category_count;
+    bool previous_available[SHELF_CATEGORY_LIMIT];
+    char previous_message[sizeof(s_message)], previous_storage[sizeof(s_storage)];
+    char previous_warning[sizeof(s_shelf_warning)];
+    s_shelf_scan_cancelled = false;
+    s_shelf_scan_yield_to_touch = s_background_index_scan || (s_view == SHELF && previous_visible > 0);
+    if (s_shelf_scan_yield_to_touch) {
+        for (int i = 0; i < previous_categories; ++i) previous_available[i] = s_categories[i].available;
+        memcpy(previous_message, s_message, sizeof(previous_message));
+        memcpy(previous_storage, s_storage, sizeof(previous_storage));
+        memcpy(previous_warning, s_shelf_warning, sizeof(previous_warning));
+        s_shelf = NULL;
+        s_shelf_capacity = 0;
+    }
     for (int i=2;i<s_category_count;++i) s_categories[i].available=false;
     s_count = 0;
     s_visible_count = 0;
@@ -5634,11 +6130,13 @@ static void scan_shelf(app_ctx_t* ctx) {
                      roots[i].is_flash ? "内置余" : "TF余", book_store_free_bytes(&roots[i]) / 1048576.0);
             strncat(s_storage, capacity, sizeof(s_storage) - strlen(s_storage) - 1);
         }
-        if (s_view == SHELF && app_poll_main_navigation(ctx)) break;
+        if (shelf_scan_interrupted(ctx)) break;
         scan_shelf_dir(ctx, roots[i].path, roots[i].is_flash, favorites, hidden,
                        &truncated, &unreadable, &skipped);
     }
-    if (ctx->request_app) {
+    if (ctx->request_app
+        && !s_shelf_scan_yield_to_touch
+    ) {
         if (favorites) nvs_close(favorites);
         if (hidden) nvs_close(hidden);
         s_shelf_cache_valid = false; s_scan_pending = true;
@@ -5659,18 +6157,54 @@ static void scan_shelf(app_ctx_t* ctx) {
     }
     if (favorites) nvs_close(favorites);
     if (hidden) nvs_close(hidden);
-    const int64_t listed_at=esp_timer_get_time();
-    if (!shelf_progress_load(ctx)) { s_shelf_cache_valid=false;s_scan_pending=true;return; }
-    const int64_t progress_at=esp_timer_get_time();
     // 补齐书根目录之外读过的书；显式移出书架的除外。
     // Backfill books read outside the roots, minus the ones removed from the shelf.
+    const bool progress_loaded = !shelf_scan_interrupted(ctx) && shelf_progress_load(ctx);
+    if (s_shelf_scan_yield_to_touch) {
+        bool interrupted = !progress_loaded || shelf_scan_interrupted(ctx) || truncated;
+        s_shelf_scan_yield_to_touch = false;
+        if (interrupted) {
+            free(s_shelf);
+            s_shelf = previous;
+            s_shelf_capacity = previous_capacity;
+            s_count = previous_count;
+            s_visible_count = previous_visible;
+            s_category_count = previous_categories;
+            for (int i = 0; i < previous_categories; ++i) s_categories[i].available = previous_available[i];
+            memcpy(s_message, previous_message, sizeof(s_message));
+            memcpy(s_storage, previous_storage, sizeof(s_storage));
+            memcpy(s_shelf_warning, previous_warning, sizeof(s_shelf_warning));
+            s_scan_pending = !truncated;
+            s_shelf_input_ms = esp_timer_get_time() / 1000;
+            if (truncated) copy_text(s_shelf_warning, sizeof(s_shelf_warning), "内存不足，保留已加载书架");
+            return;
+        }
+    }
+    else {
+        previous = NULL;
+        if (!progress_loaded) { s_shelf_cache_valid = false; s_scan_pending = true; return; }
+    }
     (void)shelf_backfill_read_books(&truncated);
-    const int64_t added_at=esp_timer_get_time();
     shelf_added_load();
-    const int64_t added_done=esp_timer_get_time();
     shelf_categories_recount();
     sort_shelf(ctx);
     if (s_view==SHELF) shelf_category_restore(ctx);
+    if (previous) {
+        const int rows = shelf_rows();
+        for (int row = 0; row < rows && ctx->leaf * rows + row < s_visible_count; ++row) {
+            shelf_entry_t *item = &s_shelf[ctx->leaf * rows + row];
+            for (int old = previous_first; old < previous_visible && old < previous_first + rows; ++old) {
+                const shelf_entry_t *entry = &previous[old];
+                if (entry->cover_identity_known && entry->size == item->size &&
+                    entry->modified == item->modified && !strcmp(entry->path, item->path)) {
+                    item->chapters = entry->chapters;
+                    item->chapters_checked = entry->chapters_checked;
+                    break;
+                }
+            }
+        }
+        free(previous);
+    }
     s_latest_path[0] = 0;
     char last_path[BOOK_STORE_PATH_MAX];
     if (book_progress_last_path(last_path, sizeof(last_path))) {
@@ -5695,10 +6229,31 @@ static void scan_shelf(app_ctx_t* ctx) {
     s_store_revision = book_store_revision();
     s_progress_revision = progress_revision;
     s_shelf_cache_valid = !unreadable && !truncated;
+    s_shelf_index_preloaded = false;
+    // 扫描完成后更新位置索引，下次开机先按索引上屏。
+    // Refresh the position index after a complete scan so the next boot can paint from it first.
+    if (s_shelf_cache_valid) shelf_cache_save();
     ESP_LOGI(TAG, "shelf books=%d roots=%d", s_count, n);
-    ESP_LOGI(TAG,"shelf scan ms=%lld list=%lld progress=%lld added=%lld books=%d",
-        (long long)((esp_timer_get_time()-scan_started)/1000),(long long)((listed_at-scan_started)/1000),
-        (long long)((progress_at-listed_at)/1000),(long long)((added_done-added_at)/1000),s_count);
+}
+
+static book_shelf_page_key_t shelf_visible_frame_key(const app_ctx_t *ctx) {
+    book_shelf_page_key_t key;
+    book_shelf_page_key_init(&key);
+    const int header[] = {ctx->leaf, s_visible_count, s_category_selected};
+    book_shelf_page_key_add(&key, header, sizeof(header));
+    book_shelf_page_key_add(&key, s_message, strlen(s_message) + 1);
+    book_shelf_page_key_add(&key, s_shelf_warning, strlen(s_shelf_warning) + 1);
+    const int rows = shelf_rows();
+    for (int row = 0; row < rows && ctx->leaf * rows + row < s_visible_count; ++row) {
+        const shelf_entry_t *item = &s_shelf[ctx->leaf * rows + row];
+        book_shelf_page_key_add(&key, item->path, strlen(item->path) + 1);
+        book_shelf_page_key_add(&key, item->name, strlen(item->name) + 1);
+        book_shelf_page_key_add(&key, item->author, strlen(item->author) + 1);
+        const int64_t fields[] = {item->size, item->modified, item->favorite, item->removed,
+            item->has_progress, item->pct, item->chapters, item->chapters_checked};
+        book_shelf_page_key_add(&key, fields, sizeof(fields));
+    }
+    return key;
 }
 
 static void refresh_cached_progress(app_ctx_t* ctx) {
@@ -5736,7 +6291,17 @@ static void refresh_cached_progress(app_ctx_t* ctx) {
     if (s_view==SHELF) shelf_category_restore(ctx);
 }
 static void return_to_cached_shelf(app_ctx_t* ctx) {
+    if (s_shelf_recheck_on_return) {
+        s_shelf_recheck_on_return = false;
+        s_scan_pending = true;
+        s_shelf_input_ms = s_poll_ms = ctx->now_ms;
+    }
     if (s_shelf_cache_valid && s_store_revision == book_store_revision()) refresh_cached_progress(ctx);
+    else if (s_visible_count > 0) {
+        shelf_category_restore(ctx);
+        s_scan_pending = true;
+        s_shelf_input_ms = s_poll_ms = ctx->now_ms;
+    }
     else scan_shelf(ctx);
 }
 
@@ -5818,6 +6383,14 @@ static app_redraw_t turn_page(app_ctx_t* ctx, int dir) {
     bool changed = true;
     if (dir > 0 && s_page + 1 < book_layout_page_count()) ++s_page;
     else if (dir < 0 && s_page) --s_page;
+    else if ((dir > 0 && s_part_more) || (dir < 0 && s_part_base)) {
+        size_t destination = dir > 0 ? s_part_base + s_text_len + 1 : s_part_base - 1;
+        if (!load_chapter(ctx, s_chapter, destination, false)) {
+            copy_text(s_reader_notice, sizeof(s_reader_notice), "本段加载失败，可重试");
+            s_reader_notice_until = ctx->now_ms + 2200;
+            return APP_REDRAW_PAGE;
+        }
+    }
     else if (dir > 0 && s_chapter + 1 < book_chapter_count()) { save_progress(); changed = load_chapter(ctx, s_chapter + 1, 0, false); }
     else if (dir < 0 && s_chapter) { save_progress(); changed = load_chapter(ctx, s_chapter - 1, 0, true); }
     else return reader_turn_chrome(ctx) ? APP_REDRAW_PAGE : APP_REDRAW_NONE;
@@ -5830,8 +6403,7 @@ static app_redraw_t turn_page(app_ctx_t* ctx, int dir) {
     if (!s_text) return APP_REDRAW_PAGE;
     s_jump_offset = SIZE_MAX;
     s_last_turn_ms = s_stats_activity_ms = ctx->now_ms;
-    ++s_stats_pending_turns;
-    ++s_session_turns;
+    ticket_count_turn();
     uint8_t full_pages = app_settings_reader_full_pages();
     if (full_pages) ++s_turns;
     else s_turns = 0;
@@ -6126,6 +6698,7 @@ static app_redraw_t apply_reader_option(app_ctx_t* ctx, int kind) {
 // 返回主页以本次开书来源为准；分类页码已在书架开书前记忆，不被目录/工具栏覆盖。
 // Return to this opening's origin; shelf category/page were saved before opening, independently of TOC/tools.
 static app_redraw_t reader_return(app_ctx_t *ctx) {
+    app_book_ticket_sample(ctx->now_ms, false);
     save_progress();
     if (s_reader_return_home) {
         ui_nav_request(ctx, 0);
@@ -6135,7 +6708,7 @@ static app_redraw_t reader_return(app_ctx_t *ctx) {
     s_view = SHELF;
     s_reader_panel = READER_PANEL_NONE;
     return_to_cached_shelf(ctx);
-    return APP_REDRAW_PAGE;
+    return APP_REDRAW_FULL;
 }
 
 
@@ -6149,6 +6722,7 @@ static app_redraw_t toggle_reader_fullscreen(app_ctx_t* ctx) {
     invalidate_prep();
     s_reader_tap.pending = false;
     s_reader_fullscreen = !s_reader_fullscreen;
+    reader_heading_viewport();
     s_reader_panel = READER_PANEL_NONE;
     unlock_draw();
     return APP_REDRAW_FULL;
@@ -6395,6 +6969,8 @@ static app_redraw_t reader_chapter_jump_action(app_ctx_t *ctx,uint16_t x,uint16_
 #pragma GCC push_options
 #pragma GCC optimize ("Os")
 #endif
+#include "apps/book_reader_rule.inc"
+
 static app_redraw_t reader_panel_action(app_ctx_t* ctx, uint16_t x, uint16_t y) {
     bool rc_handled=false;app_redraw_t rc_result=rc_panel_action(ctx,x,y,&rc_handled);if(rc_handled)return rc_result;
     if (s_reader_panel == READER_PANEL_BACKGROUND || s_reader_panel == READER_PANEL_BACKGROUND_PREVIEW)
@@ -6667,23 +7243,26 @@ static app_redraw_t reader_panel_action(app_ctx_t* ctx, uint16_t x, uint16_t y) 
         return APP_REDRAW_NONE;
     }
     if (s_reader_panel == READER_PANEL_RULE_SETTINGS) {
-        if (y < 729 || ui_rect_hit((EpdRect){36, 1113, 612, 72}, x, y)) {
+        if (y < 729 || ui_rect_hit(rule_back_rect(), x, y)) {
             s_reader_panel = READER_PANEL_FONT_SETTINGS;
+            return APP_REDRAW_PAGE;
+        }
+        if (ui_rect_hit(rule_save_rect(), x, y)) {
+            const char *text = !app_settings_book_reading_line() ? "请先选择虚线或点线" :
+                app_settings_save_book_reading_line() ? "阅读线格式已保存" : "保存失败，请重试";
+            copy_text(s_reader_notice, sizeof(s_reader_notice), text);
+            s_reader_notice_until = ctx->now_ms + 1800;
             return APP_REDRAW_PAGE;
         }
         for (int i = 0; i < 3; ++i) {
             if (!ui_rect_hit(rule_style_rect(i), x, y)) continue;
             app_settings_set_book_reading_line((uint8_t)i);
-            book_layout_set_reading_line((unsigned)i);
-            invalidate_prep();
-            return APP_REDRAW_PAGE;
+            return apply_reader_rule(ctx);
         }
         for (int i = 0; i < 2; ++i) {
             if (!ui_rect_hit(rule_span_rect(i), x, y)) continue;
             if (!app_settings_set_book_reading_line_full(i != 0)) return APP_REDRAW_NONE;
-            book_layout_set_reading_line_full(app_settings_book_reading_line_full());
-            invalidate_prep();
-            return APP_REDRAW_PAGE;
+            return apply_reader_rule(ctx);
         }
         if (app_settings_book_reading_line()) {
             int offset = app_settings_book_reading_line_offset();
@@ -6694,9 +7273,7 @@ static app_redraw_t reader_panel_action(app_ctx_t* ctx, uint16_t x, uint16_t y) 
             if (offset < -8) offset = -8;
             if (offset > 8) offset = 8;
             app_settings_set_book_reading_line_offset((int8_t)offset);
-            book_layout_set_reading_line_offset(offset);
-            invalidate_prep();
-            return APP_REDRAW_PAGE;
+            return apply_reader_rule(ctx);
         }
         return APP_REDRAW_NONE;
     }
@@ -6968,6 +7545,7 @@ static app_redraw_t bulk_action(app_ctx_t* ctx,uint16_t x,uint16_t y) {
         int first=ctx->leaf*shelf_rows();s_bulk_grid=!s_bulk_grid;ctx->leaf=first/shelf_rows();
         s_batch_message[0]=0;return APP_REDRAW_PAGE;
     }
+    if(ui_rect_hit(ui_book_manage_get_cover(),x,y))return bulk_cover_start(ctx);
     if(ui_rect_hit(bulk_filter_rect(1),x,y)){s_sort_menu=true;return APP_REDRAW_PAGE;}
     if(ui_rect_hit(bulk_filter_rect(2),x,y)){
         if(s_query[0]&&x>=600){s_query[0]=0;refresh_search_matches();clear_selection();sort_shelf(ctx);}
@@ -6990,7 +7568,7 @@ static app_redraw_t bulk_action(app_ctx_t* ctx,uint16_t x,uint16_t y) {
         else if(s_shelf[index].removed){
             s_managed=s_shelf[index];s_view=MANAGE;s_file_removed=s_delete_confirm=true;s_clear_confirm=false;
             copy_text(s_manage_message,sizeof(s_manage_message),"文件已删除，进度清理失败，请重试");
-        }else {s_reader_return_home=false;open_book(ctx,s_shelf[index].path);}
+        } else return queue_shelf_open(s_shelf[index].path);
         return APP_REDRAW_PAGE;
     }
     return APP_REDRAW_NONE;
@@ -7003,6 +7581,7 @@ static int bulk_control_at(app_ctx_t* ctx,uint16_t x,uint16_t y,EpdRect* rect) {
     }
     for(int i=0;i<3;++i){*rect=bulk_filter_rect(i);if(ui_rect_hit(*rect,x,y))return 110+i;}
     *rect=ui_book_manage_select();if(ui_rect_hit(*rect,x,y))return 113;
+    *rect=ui_book_manage_get_cover();if(ui_rect_hit(*rect,x,y))return UI_BOOK_MANAGE_COVER_CONTROL;
     *rect=ui_book_manage_import();if(ui_rect_hit(*rect,x,y))return 115;
     *rect=ui_book_manage_style();if(ui_rect_hit(*rect,x,y))return 116;
     for(int i=UI_PAGER_FIRST;i<=UI_PAGER_LAST;++i){*rect=bulk_nav_rect(i);if(ui_rect_hit(*rect,x,y))return 100+i;}
@@ -7189,6 +7768,7 @@ static app_redraw_t action_at(app_ctx_t* ctx, uint16_t x, uint16_t y) {
             if (load_chapter_at(ctx, chapter, 0, false, book_navigation_anchor((size_t)target),
                                 book_navigation_source_offset((size_t)target))) {
                 s_selected_toc = (size_t)target;
+                s_selected_toc_offset = reader_page_offset(s_page);
                 char entry_title[sizeof(s_title)];
                 if (book_navigation_title((size_t)target, entry_title, sizeof(entry_title)) == ESP_OK)
                     copy_text(s_title, sizeof(s_title), entry_title);
@@ -7318,7 +7898,7 @@ static app_redraw_t action_at(app_ctx_t* ctx, uint16_t x, uint16_t y) {
             if (s_shelf[i].removed) {
                 s_managed = s_shelf[i]; s_view = MANAGE; s_file_removed = s_delete_confirm = true; s_clear_confirm = false;
                 copy_text(s_manage_message, sizeof(s_manage_message), "文件已删除，进度清理失败，请重试");
-            } else open_book(ctx, s_shelf[i].path);
+            } else return queue_shelf_open(s_shelf[i].path);
         }
         return APP_REDRAW_PAGE;
     }
@@ -7328,6 +7908,7 @@ static app_redraw_t action_at(app_ctx_t* ctx, uint16_t x, uint16_t y) {
 #pragma GCC pop_options
 #endif
 static void on_enter(app_ctx_t* ctx) {
+    if (cover_lookup_resume()) return;
     if(s_manage_style_restore){
         s_manage_style_restore=false;read_pico_sd_info_t sd={0};
         if(s_view==BULK&&s_shelf_cache_valid&&read_pico_sd_get_info(&sd)==ESP_OK&&
@@ -7373,7 +7954,7 @@ static void on_enter(app_ctx_t* ctx) {
         s_book_fonts_applied = book_fonts;
         book_set_embedded_fonts(book_fonts);
         if (s_text && book_kind() == BOOK_KIND_EPUB)
-            (void)load_chapter(ctx, s_chapter, book_layout_page_start_offset(s_page), false);
+            (void)load_chapter(ctx, s_chapter, reader_saved_offset(s_page), false);
     }
     s_reader_fullscreen = false;
     s_bookmark_edit = s_bookmark_delete_confirm = s_bookmark_delete_error = false;
@@ -7409,26 +7990,57 @@ static void on_enter(app_ctx_t* ctx) {
                  sd.present == s_cache_sd_present && sd.mounted == s_cache_sd_mounted &&
                  s_cache_shelf_style == app_settings_shelf_style() &&
                  s_store_revision == book_store_revision();
-    s_scan_pending = !reuse;
+    if (reuse && s_shelf_recheck_on_return) {
+        s_scan_pending = true;
+        s_shelf_input_ms = s_poll_ms = ctx->now_ms;
+    }
+    s_shelf_recheck_on_return = false;
     if (reuse) {
+        // 先用已预热的目录出首帧，完整扫描会补齐添加时间和阅读进度。
+        // Paint from the warmed catalog first; the full scan will reconcile added dates and progress.
+        if (s_shelf_index_preloaded) shelf_category_restore(ctx);
+        else
         refresh_cached_progress(ctx);
         (void)open_requested_book(ctx);
     } else {
-        s_count = s_visible_count = 0;
-        s_message[0] = 0;
-        s_storage[0] = 0;
-        invalidate_covers();
         // 已指定文件可直接打开；书架目录留到真正进入书架时再扫描。
         // Open a requested file directly; scan the shelf only when it is actually shown.
         if (open_requested_book(ctx)) {
             s_scan_pending = false;
             return;
         }
-        read_pico_sd_start_probe();
+        // 用户2026-11-05：加载期间给一条小提示，扫描/封面准备完成后的重绘会清掉它。
+        // User2026-11-05: show a short hint while loading; the repaint after scan/covers clears it.
+        copy_text(s_message, sizeof(s_message), "正在加载书架…");
+        // 用户2026-11-05：先读 .kiikoread/shelf.idx 直接上屏，目录和封面留给后台核对，
+        // 避免每次开机逐本 stat、解析元数据并重解码封面。
+        // User2026-11-05: paint from .kiikoread/shelf.idx first and reconcile in the background,
+        // instead of stat/parsing every book and re-decoding covers on every boot.
+        if (shelf_cache_load(ctx, false)) {
+            // 索引只恢复列表；封面槽位清空后由缓存/后台重新装，避免沿用上一页的槽位状态。
+            // The index restores the list only; clear cover slots so they reload from the card.
+            invalidate_covers();
+            s_scan_pending = true;
+            s_poll_ms = ctx->now_ms;
+            s_message[0] = 0;
+            s_shelf_input_ms = ctx->now_ms;
+            read_pico_sd_start_probe();
+        } else {
+            s_count = s_visible_count = 0;
+            s_message[0] = 0;
+            s_storage[0] = 0;
+            invalidate_covers();
+            read_pico_sd_start_probe();
+        }
     }
 
 }
 static void book_on_exit(app_ctx_t* ctx) {
+    cancel_shelf_open();
+    app_book_ticket_sample(ctx->now_ms, false);
+    cover_lookup_cleanup();
+    if (s_view == SHELF && s_scan_pending) s_shelf_recheck_on_return = true;
+    invalidate_covers();
     rc_stop_auto();rc_cancel_side();s_rc_double_pending=false;
     book_shelf_page_pause();
     s_shelf_page_key_valid=s_shelf_page_loading=s_shelf_page_cached=false;
@@ -7466,6 +8078,9 @@ static void book_on_exit(app_ctx_t* ctx) {
 // 先停止使用旧卡句柄与字体预渲染，主循环随后切换内置字体。
 // Stop old-card handles and font preparation before the loop switches to the builtin font.
 static void book_on_media_lost(app_ctx_t* ctx) {
+    cancel_shelf_open();
+    cover_lookup_cleanup();
+    if (s_view == COVER_LOOKUP) s_view = BULK;
     rc_stop_auto();rc_cancel_side();s_rc_double_pending=false;
     book_shelf_page_release();
     s_shelf_page_key_valid=s_shelf_page_loading=s_shelf_page_cached=false;
@@ -7482,6 +8097,9 @@ static void book_on_media_lost(app_ctx_t* ctx) {
     s_view = SHELF;
     s_count = s_visible_count = 0;
     s_shelf_cache_valid = false;
+    ++s_shelf_catalog_epoch;
+    s_shelf_recheck_on_return = false;
+    s_shelf_index_preloaded = false;
     free(s_shelf); s_shelf = NULL; s_shelf_capacity = 0;
     invalidate_covers();
     ctx->leaf = 0;
@@ -7497,7 +8115,11 @@ static void book_on_media_lost(app_ctx_t* ctx) {
 static void book_on_media_ready(app_ctx_t* ctx) {
     (void)ctx;
     s_shelf_cache_valid = false;
-    if (s_view == SHELF) s_scan_pending = true;
+    if (s_view == SHELF) {
+        s_scan_pending = true;
+        ++s_shelf_catalog_epoch;
+        invalidate_covers();
+    }
 }
 // 控件编号仅用于保持按下与抬起命中同一个目标。/ IDs pair a press with release on the same control.
 static int control_at(app_ctx_t* ctx, uint16_t x, uint16_t y, EpdRect* rect) {
@@ -7887,6 +8509,8 @@ static app_redraw_t shelf_sort_gesture(app_ctx_t*ctx,const ui_gesture_event_t*ev
     s_sort_menu=false;return APP_REDRAW_PAGE;
 }
 static app_redraw_t gesture_event(app_ctx_t* ctx, const ui_gesture_event_t* ev) {
+    if (s_view == COVER_LOOKUP) return cover_lookup_gesture(ev);
+    if (s_view == SHELF) s_shelf_input_ms = ctx->now_ms;
     if(s_view==SHELF&&s_sort_menu)return shelf_sort_gesture(ctx,ev);
     app_redraw_t pager_redraw;
     if (shelf_pager_event(ctx, ev, &pager_redraw)) return pager_redraw;
@@ -8026,6 +8650,10 @@ static app_redraw_t gesture_event(app_ctx_t* ctx, const ui_gesture_event_t* ev) 
     int start = control_at(ctx, ev->x0, ev->y0, &start_rect);
     int end = control_at(ctx, ev->x, ev->y, &end_rect);
     if (ev->type == UI_GESTURE_PRESS) {
+        if (s_view == SHELF && start >= 0 && start < shelf_rows()) {
+            s_pressed_control = -1;
+            return APP_REDRAW_NONE;
+        }
         s_pressed_control = start;
         return start >= 0 ? paint_control(ctx, start_rect) : APP_REDRAW_NONE;
     }
@@ -8051,20 +8679,23 @@ static app_redraw_t gesture_event(app_ctx_t* ctx, const ui_gesture_event_t* ev) 
             return APP_REDRAW_PAGE;
         }
     }
-    if (ev->type == UI_GESTURE_TAP && !s_scan_pending) {
+    if (ev->type == UI_GESTURE_TAP && !shelf_waiting_for_index()) {
         if (start >= 0 && start == end) {
-            // 列表先完成回弹，才释放封面缓存并开书；没有人为等待或整页预刷新。
-            // Settle a list bounce before opening frees artwork, without a delay or whole-page pre-refresh.
-            if (decorated && s_view == SHELF && shelf_display_style() == 5 && start < shelf_rows())
+            // 确认点开后只推封面上移，开书再释放缓存。/ Lift only on a confirmed tap, before opening releases the cover.
+            if (s_view == SHELF && s_presented_view == SHELF && !s_shelf_page_pending &&
+                start < shelf_rows() && !s_shelf[ctx->leaf * shelf_rows() + start].removed) {
+                s_pressed_control = start;
                 (void)present(ctx, paint_control(ctx, start_rect));
+                s_pressed_control = -1;
+            }
             app_redraw_t result = action_at(ctx, ev->x0, ev->y0);
-            if (ctx->request_app || ctx->request_menu || ctx->request_return) return result;
+            if (s_shelf_open_queued || ctx->request_app || ctx->request_menu || ctx->request_return) return result;
             return result != APP_REDRAW_NONE ? result : paint_control(ctx, start_rect);
         }
         if (start < 0 && end < 0 && s_view == READING && !s_clear_confirm)
             return action_at(ctx, ev->x0, ev->y0);
     }
-    if (!s_clear_confirm && !s_scan_pending) {
+    if (!s_clear_confirm && !shelf_waiting_for_index()) {
         if (s_view == READING && (!s_toolbar || (s_reader_panel == READER_PANEL_TOOLS && ev->y0 < 1096)) &&
             ui_rect_hit(reader_area(), ev->x0, ev->y0) && ui_rect_hit(body_rect(), ev->x0, ev->y0)) {
             int direction = reader_swipe_direction(ev->type, app_settings_reader_vertical_turn());
@@ -8103,6 +8734,12 @@ static app_redraw_t reader_key_action(app_ctx_t *ctx, app_reader_key_action_t ac
     }
 }
 static app_redraw_t on_key(app_ctx_t* ctx, int key) {
+    if (s_view == COVER_LOOKUP) {
+        if (key == UI_KEY_2) return cover_lookup_back();
+        if (key == UI_KEY_1) return cover_lookup_page(-1);
+        if (key == UI_KEY_3) return cover_lookup_page(1);
+        return APP_REDRAW_NONE;
+    }
     rc_pause_auto();rc_cancel_side();s_rc_double_pending=false;
     if (s_reader_panel == READER_PANEL_FONT_RECOVERY) {
         reader_font_recovery_reset(); s_reader_panel = READER_PANEL_FONT_PICKER;
@@ -8201,9 +8838,10 @@ static bool menu_handle_enabled(app_ctx_t* ctx) {
 }
 static app_redraw_t shelf_turn_page(app_ctx_t *ctx, int direction) {
     int next = ctx->leaf + direction;
-    if (s_view != SHELF || s_sort_menu || s_scan_pending || s_clear_confirm || next == ctx->leaf || next < 0 || next >= leaves())
+    if (s_view != SHELF || s_sort_menu || shelf_waiting_for_index() || s_clear_confirm || next == ctx->leaf || next < 0 || next >= leaves())
         return APP_REDRAW_NONE;
     ctx->leaf = next;
+    s_shelf_input_ms = ctx->now_ms;
     shelf_category_remember(ctx);
     s_category_menu=false;
     s_shelf_page_pending = true;
@@ -8275,11 +8913,50 @@ static app_redraw_t reader_font_recovery_tick(app_ctx_t *ctx) {
     app_restart_host();
     return APP_REDRAW_DONE;
 }
+static app_redraw_t shelf_cover_tick(app_ctx_t *ctx) {
+    if ((s_view != SHELF && s_view != MANAGE && s_view != BULK) ||
+        (ctx->touch && ctx->touch->touched)) return APP_REDRAW_NONE;
+    if (s_view == SHELF && (s_category_menu || s_sort_menu || s_clear_confirm))
+        return APP_REDRAW_NONE;
+    (void)prepare_cover_batch(ctx, false);
+    if (ctx->request_app) return APP_REDRAW_NONE;
+    const unsigned changed = shelf_cover_reveal_mask();
+    if (s_view == SHELF && app_touch_input_pending(ctx)) return APP_REDRAW_NONE;
+    const int rows_now = shelf_rows();
+    EpdRect area = {0};
+    for (int row = 0; row < rows_now; ++row) {
+        if (!(changed & (1u << row))) continue;
+        EpdRect r = row_rect(row);
+        area = area.width ? ui_rect_union(area, r) : r;
+    }
+    if (!area.width) return APP_REDRAW_NONE;
+    render(ctx, ctx->fb);
+    if (s_view == SHELF && app_touch_input_pending(ctx)) return APP_REDRAW_NONE;
+    s_area = area;
+    s_mode = s_view == SHELF && app_settings_main_fast_refresh() ? MODE_DU : MODE_GL16;
+    s_shelf_feedback_pending = s_view == SHELF;
+    s_cover_batch_present_pending = true;
+    s_cover_present_mask = changed;
+    return APP_REDRAW_AREA;
+}
+
 static app_redraw_t on_tick(app_ctx_t* ctx) {
+    if (s_shelf_open_queued) {
+        if (!ctx->request_app && (s_view == SHELF || s_view == BULK)) {
+            s_shelf_open_queued = false;
+            (void)open_requested_book(ctx);
+            return APP_REDRAW_PAGE;
+        }
+        cancel_shelf_open();
+    }
+    const app_redraw_t cover_lookup = bulk_cover_tick(ctx);
+    if (cover_lookup != APP_REDRAW_NONE || s_view == COVER_LOOKUP) return cover_lookup;
+    if (ctx->consumed || (ctx->touch && ctx->touch->touched)) s_shelf_input_ms = ctx->now_ms;
     app_redraw_t recovery = reader_font_recovery_tick(ctx);
     if (recovery != APP_REDRAW_NONE) return recovery;
     if (s_reader_panel == READER_PANEL_FONT_RECOVERY) return APP_REDRAW_NONE;
 
+    if (s_reader_rule_pending) return reader_rule_tick(ctx);
     app_redraw_t rc_result=rc_tick(ctx);if(rc_result!=APP_REDRAW_NONE)return rc_result;
     app_redraw_t indent=reader_indent_hold_tick(ctx);
     if(indent!=APP_REDRAW_NONE)return indent;
@@ -8291,7 +8968,7 @@ static app_redraw_t on_tick(app_ctx_t* ctx) {
     if (s_fonts_reload_pending) {
         s_fonts_reload_pending = false;
         if (s_text && book_kind() == BOOK_KIND_EPUB)
-            (void)load_chapter(ctx, s_chapter, book_layout_page_start_offset(s_page), false);
+            (void)load_chapter(ctx, s_chapter, reader_saved_offset(s_page), false);
         return APP_REDRAW_PAGE;
     }
     if (s_view != READING || (s_toolbar && s_reader_panel != READER_PANEL_TOOLS) || s_clear_confirm || ctx->consumed) s_reader_tap.pending = false;
@@ -8301,7 +8978,6 @@ static app_redraw_t on_tick(app_ctx_t* ctx) {
             return s_reader_fullscreen ? APP_REDRAW_NONE : toggle_reader_fullscreen(ctx);
         if (tap) return turn_page(ctx, tap);
     }
-    track_ticket_stats(ctx);
     if (s_view == SEARCH || s_view == EDIT) {
         if (ctx->consumed) return APP_REDRAW_NONE;
         bool held = !ctx->released && ctx->touch && ctx->touch->touched && ctx->touch->count == 1;
@@ -8350,53 +9026,47 @@ static app_redraw_t on_tick(app_ctx_t* ctx) {
     }
     app_redraw_t background = reader_background_tick();
     if (background != APP_REDRAW_NONE) return background;
-    if (s_scan_pending && ctx->now_ms - s_poll_ms >= 500) {
+    // 缓存索引上屏后先让封面任务占住 SD，再后台核对目录；最多等 8 秒。
+    // After painting from the cached index let the cover jobs own the card first; cap the wait at 8 s.
+    app_redraw_t cover_redraw = shelf_cover_tick(ctx);
+    if (cover_redraw != APP_REDRAW_NONE || ctx->request_app) return cover_redraw;
+    const bool cover_busy = s_view == SHELF && (s_cover_pending_mask != 0
+                                                || s_cover_dirty_mask != 0
+                                                );
+    if (s_scan_pending && ctx->now_ms - s_poll_ms >= 500 &&
+        (s_view != READING && s_view != TOC) &&
+        (!s_visible_count || (ctx->now_ms - s_shelf_input_ms >= 2000 && !app_touch_input_pending(ctx))) &&
+        (!cover_busy || ctx->now_ms - s_poll_ms >= 8000)) {
         s_poll_ms = ctx->now_ms;
         read_pico_sd_info_t info = {0};
         if (read_pico_sd_get_info(&info) == ESP_ERR_NOT_FINISHED) return APP_REDRAW_NONE;
+        const bool visible_shelf = s_view == SHELF && s_visible_count > 0 && !cover_busy &&
+            !s_category_menu && !s_sort_menu && !s_clear_confirm && !s_batch_confirm;
+        const book_shelf_page_key_t before = visible_shelf ?
+            shelf_visible_frame_key(ctx) : (book_shelf_page_key_t){0};
+        const bool had_shelf_request = s_requested_open[0] != '\0';
         s_scan_pending = false;
         scan_shelf(ctx);
-        if (ctx->request_app) return APP_REDRAW_NONE;
+        if (ctx->request_app || s_scan_pending) return APP_REDRAW_NONE;
         (void)open_requested_book(ctx);
-        return APP_REDRAW_PAGE;
-    }
-    if ((s_view == SHELF || s_view == MANAGE || s_view == BULK) && !(ctx->touch && ctx->touch->touched)) {
-        (void)prepare_cover_batch(ctx, false);
-        // 整页准备好再合并推屏；占位页或失败输出不能消费已加载封面的待刷标记。
-        // Reveal only a complete cover group; placeholders and failed output cannot consume pending artwork.
-        unsigned changed=shelf_cover_reveal_mask();
-        if (ctx->request_app) return APP_REDRAW_NONE;
-        EpdRect area = {0};
-        for (int row = 0; row < shelf_rows(); ++row) {
-            if (!(changed & (1u << row))) continue;
-            EpdRect r = row_rect(row);
-            if (!area.width) area = r;
-            else {
-                int right = area.x+area.width > r.x+r.width ? area.x+area.width : r.x+r.width;
-                int bottom = area.y+area.height > r.y+r.height ? area.y+area.height : r.y+r.height;
-                if (r.x < area.x) area.x = r.x;
-                if (r.y < area.y) area.y = r.y;
-                area.width = right-area.x; area.height = bottom-area.y;
+        if (visible_shelf && !had_shelf_request && s_view == SHELF) {
+            const book_shelf_page_key_t after = shelf_visible_frame_key(ctx);
+            if (!memcmp(&before, &after, sizeof(before))) {
+                prepare_covers(ctx);
+                if (!s_cover_pending_mask) s_cover_dirty_mask = 0;
+                return APP_REDRAW_NONE;
             }
         }
-        if (area.width) {
-            render(ctx, ctx->fb);
-            s_area = area;
-            s_mode = s_view == SHELF && app_settings_main_fast_refresh() ? MODE_DU : MODE_GL16;
-            s_shelf_feedback_pending = s_view == SHELF;
-            s_cover_batch_present_pending = true;
-            s_cover_present_mask=changed;
-            return APP_REDRAW_AREA;
-        }
+        return APP_REDRAW_PAGE;
     }
     if(s_view==SHELF&&!ctx->consumed&&!ctx->request_app&&!ctx->request_menu&&!ctx->request_return&&!(ctx->touch&&ctx->touch->touched)){
+        if (app_touch_input_pending(ctx)) return APP_REDRAW_NONE;
         if(shelf_chapters_tick(ctx)){
             render(ctx,ctx->fb);s_area=(EpdRect){120,184,528,768};s_mode=MODE_GL16;
             s_shelf_feedback_pending=true;return APP_REDRAW_AREA;
         }
-        book_shelf_page_idle(ctx->now_ms);shelf_prefetch_tick(ctx);
+        shelf_prefetch_tick(ctx);
     }
-    warm_shelf_lock_cover(ctx);
     if (ctx->request_app) return APP_REDRAW_NONE;
     // 目录暂借系统字体，不应把正文按系统字体重新分页。/ The directory borrows the system face without repaginating the reader.
     if (s_view == READING && s_text && strcmp(s_font_path, ttf_font_path())) {
@@ -8418,6 +9088,8 @@ static app_redraw_t on_tick(app_ctx_t* ctx) {
     return clock;
 }
 static void before_lock(app_ctx_t* ctx) {
+    cancel_shelf_open();
+    book_weread_cover_cancel();
     rc_stop_auto();rc_cancel_side();s_rc_double_pending=false;
     book_shelf_page_release();
     s_shelf_page_key_valid=s_shelf_page_loading=s_shelf_page_cached=false;
@@ -8426,7 +9098,7 @@ static void before_lock(app_ctx_t* ctx) {
     shelf_category_remember(ctx);
     s_category_menu=false;
     s_reader_tap.pending = false;
-    track_ticket_stats(ctx);
+    app_book_ticket_sample(ctx->now_ms, false);
     save_progress();
     // 锁屏前丢弃分行预绘，后续只按当前字体重建。/ Discard idle prefetch before lock; rebuild only with the current face.
     lock_draw();
@@ -8435,7 +9107,6 @@ static void before_lock(app_ctx_t* ctx) {
     // 锁屏票根始终以当前正在阅读的书为准；不要依赖书架最近项是否已经同步。
     if (s_text && s_path[0]) book_progress_set_last_path(s_path);
     flush_ticket_stats();
-    s_stats_last_ms = 0;
 }
 static EpdRect area_hint(app_ctx_t* ctx) { (void)ctx; return s_area; }
 static bool main_page_visible(app_ctx_t* ctx) {
@@ -8444,8 +9115,15 @@ static bool main_page_visible(app_ctx_t* ctx) {
 }
 
 
+#if defined(__XTENSA__) && defined(__GNUC__)
+#pragma GCC push_options
+#pragma GCC optimize("Os")
+#endif
 #include "apps/book_reader_controls_ui.inc"
 #include "apps/book_reader_controls_runtime.inc"
+#if defined(__XTENSA__) && defined(__GNUC__)
+#pragma GCC pop_options
+#endif
 
 const app_desc_t app_book = {
     .title = "图书 Books", .detail = "TF 卡 txt / epub 阅读", .enter_full = false, .owns_keys = true,

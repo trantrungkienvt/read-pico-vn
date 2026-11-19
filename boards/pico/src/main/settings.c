@@ -28,6 +28,7 @@
 
 #include <stdio.h>
 #include <stddef.h>
+#include <stdlib.h>
 #include <errno.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -40,6 +41,7 @@
 #include "read_pico_sd.h"
 #include "read_pico_transfer.h"
 #include "book/book_history_backup.h"
+#include "book/book_progress.h"
 
 #define TAG "settings"
 #define NVS_NS KIIKO_BOARD_SETTINGS_NAMESPACE
@@ -157,6 +159,7 @@ static bool s_book_fonts = true;
 static bool s_book_vertical;
 static uint8_t s_book_tracking = -APP_BOOK_TRACK_MIN, s_book_reading_line, s_book_rule_offset = 4;
 static bool s_book_rule_full;
+#include "settings_reading_line.inc"
 static uint8_t s_book_indent = 2;
 static uint8_t s_book_indent_adjust = 20;
 static uint8_t s_auto_lock_minutes;
@@ -202,6 +205,9 @@ static uint8_t valid_book_px(uint8_t px) {
 
 void app_settings_init(void) {
     s_reader_controls_loaded=false;s_shelf_badges=true;
+    s_book_heading_style = BOOK_HEADING_DEFAULT_STYLE;
+    s_book_heading_align = BOOK_HEADING_DEFAULT_ALIGN;
+    s_book_heading_size = APP_BOOK_HEADING_SIZE_DEFAULT;
     // 缺省与读取失败采用新默认，随后仅由有效的已保存选择覆盖。
     // Use current defaults on missing/failed reads, then apply valid saved preferences.
     s_home_full_refresh = true;
@@ -363,10 +369,12 @@ void app_settings_init(void) {
     }
     if (nvs_get_u8(h, NVS_KEY_BOOK_RULE, &reading_line) == ESP_OK && reading_line <= 2)
         s_book_reading_line = reading_line;
+    book_heading_style_load(h);
     uint8_t rule_full = 0;
     s_book_rule_full = nvs_get_u8(h, NVS_KEY_BOOK_RULE_FULL, &rule_full) == ESP_OK && rule_full == 1;
     if (nvs_get_u8(h, NVS_KEY_BOOK_RULE_OFFSET, &rule_offset) == ESP_OK && rule_offset <= 8)
         s_book_rule_offset = rule_offset;
+    book_rule_saved_load(h);
     if (nvs_get_u8(h, NVS_KEY_BOOK_INDENT, &indent) == ESP_OK && indent <= 3)
         s_book_indent = indent;
     s_book_indent_adjust = nvs_get_u8(h, NVS_KEY_BOOK_INDENT_ADJUST, &indent_adjust) == ESP_OK && indent_adjust <= 200
@@ -1016,6 +1024,11 @@ static bool backup_hold_valid(const settings_backup_hold_t *hold) {
     for (unsigned i = 0; i < 4; ++i) stored |= (uint32_t)hold->checksum[i] << (8 * i);
     return hold->action < APP_READER_KEY_COUNT && stored == backup_hold_checksum(hold);
 }
+// v26复用五字节校验块保存阅读线预设，不改变旧字段偏移。/ V26 seals the guide preset in five bytes without moving legacy fields.
+static bool backup_guide_valid(const settings_backup_hold_t *guide) {
+    uint32_t sum=0;for(unsigned i=0;i<4;++i)sum|=(uint32_t)guide->checksum[i]<<(8*i);
+    return book_rule_saved_valid(guide->action)&&sum==backup_hold_checksum(guide);
+}
 // v12 追加独立校验的微调块，保留旧字段偏移与旧备份读取。/ V12 appends a sealed adjustment block, preserving legacy fields and readers.
 typedef struct { uint8_t encoded, checksum[4]; } settings_backup_indent_adjust_t;
 static uint32_t backup_indent_adjust_checksum(const settings_backup_indent_adjust_t *adjust) {
@@ -1061,7 +1074,7 @@ static bool backup_home_valid(const settings_backup_home_t *v) {
 static unsigned backup_version(const settings_backup_v1_t *backup) {
     if (memcmp(backup->magic, "PICOSET", 7)) return 0;
     unsigned char c = backup->magic[7];
-    return c >= '1' && c <= '9' ? c - '0' : c == 'A' ? 10 : c == 'B' ? 11 : c == 'C' ? 12 : c == 'D' ? 13 : c == 'E' ? 14 : c == 'F' ? 15 : c == 'G' ? 16 : c == 'H' ? 17 : c == 'I' ? 18 : c == 'J' ? 19 : c == 'K' ? 20 : c == 'L' ? 21 : c == 'M' ? 22 : c == 'N' ? 23 : c == 'O' ? 24 : c == 'P' ? 25 : 0;
+    return c >= '1' && c <= '9' ? c - '0' : c == 'A' ? 10 : c == 'B' ? 11 : c == 'C' ? 12 : c == 'D' ? 13 : c == 'E' ? 14 : c == 'F' ? 15 : c == 'G' ? 16 : c == 'H' ? 17 : c == 'I' ? 18 : c == 'J' ? 19 : c == 'K' ? 20 : c == 'L' ? 21 : c == 'M' ? 22 : c == 'N' ? 23 : c == 'O' ? 24 : c == 'P' ? 25 : c == 'Q' ? 26 : 0;
 }
 
 static void backup_erase_secret(void *ptr, size_t size) {
@@ -1138,10 +1151,11 @@ static bool backup_card_ready(void) {
     return read_pico_sd_get_info(&info) == ESP_OK && info.mounted;
 }
 
-esp_err_t app_settings_backup_save(void) {
-    if (!backup_card_ready()) return ESP_ERR_INVALID_STATE;
+// 备份先写进调用方给的流：TF 卡和内存导出共用同一份字节。
+// Write into a caller-owned stream so the card and memory exports share one byte layout.
+static esp_err_t backup_write_stream(FILE *file, bool rotate) {
     settings_backup_v1_t backup = {0};
-    memcpy(backup.magic, "PICOSETP", sizeof(backup.magic));
+    memcpy(backup.magic, "PICOSETQ", sizeof(backup.magic));
     uint8_t *f = backup.flags;
     f[BK_SLEEP] = s_sleep;
     f[BK_PICKUP] = s_pickup_wake;
@@ -1207,6 +1221,12 @@ esp_err_t app_settings_backup_save(void) {
     for (unsigned i = 0; i < 4; ++i) weight.checksum[i] = (uint8_t)(weight_hash >> (8 * i));
     settings_backup_wifi_t wifi = {0};
     esp_err_t wifi_err = read_pico_transfer_export_wifi_backup(&wifi.credentials);
+    // 没存过网络时导出返回未找到；备份仍可用，只是一条 WiFi 记录都不带。
+    // An unconfigured device reports not-found; keep the backup usable without a WiFi record.
+    if (wifi_err == ESP_ERR_NOT_FOUND || wifi_err == ESP_ERR_NVS_NOT_FOUND) {
+        memset(&wifi, 0, sizeof(wifi));
+        wifi_err = ESP_OK;
+    }
     if (wifi_err != ESP_OK) { backup_erase_secret(&wifi, sizeof(wifi)); return wifi_err; }
     backup_wifi_seal(&wifi);
     settings_backup_background_t background = {0};
@@ -1214,8 +1234,6 @@ esp_err_t app_settings_backup_save(void) {
     uint32_t background_hash = backup_background_checksum(&background);
     for (unsigned i = 0; i < 4; ++i) background.checksum[i] = (uint8_t)(background_hash >> (8 * i));
 
-    FILE *file = fopen(BACKUP_TEMP, "wb");
-    if (!file) { backup_erase_secret(&wifi, sizeof(wifi)); return ESP_FAIL; }
     bool ok = fwrite(&backup, 1, sizeof(backup), file) == sizeof(backup);
     if (ok) ok = fwrite(extension, 1, sizeof(extension), file) == sizeof(extension);
     if (ok) ok = fwrite(&profile, 1, sizeof(profile), file) == sizeof(profile);
@@ -1239,10 +1257,17 @@ esp_err_t app_settings_backup_save(void) {
     if(ok)ok=fwrite(&controls,1,sizeof(controls),file)==sizeof(controls);
     settings_backup_shelf_t shelf=backup_shelf_make(s_shelf_order,s_shelf_badges);
     if(ok)ok=fwrite(&shelf,1,sizeof(shelf),file)==sizeof(shelf);
+    settings_backup_hold_t guide={.action=s_book_rule_saved};
+    uint32_t guide_hash=backup_hold_checksum(&guide);
+    for(unsigned i=0;i<4;++i)guide.checksum[i]=guide_hash>>(8*i);
+    if(ok)ok=fwrite(&guide,1,sizeof(guide),file)==sizeof(guide);
     if (ok) ok = book_history_backup_write(file) == ESP_OK;
     if (ok) ok = fflush(file) == 0;
-    if (ok) ok = fsync(fileno(file)) == 0;
+    // memstream 没有文件描述符；只有卡上的文件需要 fsync。
+    // A memstream has no descriptor; only the card file needs fsync.
+    if (ok && fileno(file) >= 0) ok = fsync(fileno(file)) == 0;
     if (fclose(file) != 0) ok = false;
+    if (!rotate) return ok ? ESP_OK : ESP_FAIL;
     bool rotated = false;
     if (ok && remove(BACKUP_PREVIOUS) != 0 && errno != ENOENT) ok = false;
     if (ok && rename(BACKUP_FILE, BACKUP_PREVIOUS) == 0) rotated = true;
@@ -1250,7 +1275,32 @@ esp_err_t app_settings_backup_save(void) {
     if (ok && rename(BACKUP_TEMP, BACKUP_FILE) != 0) ok = false;
     if (!ok && rotated) (void)rename(BACKUP_PREVIOUS, BACKUP_FILE);
     if (ok && rotated) (void)remove(BACKUP_PREVIOUS);
-    if (!ok) { (void)remove(BACKUP_TEMP); return ESP_FAIL; }
+    if (!ok) { if (rotate) (void)remove(BACKUP_TEMP); return ESP_FAIL; }
+    return ESP_OK;
+}
+
+esp_err_t app_settings_backup_save(void) {
+    if (!backup_card_ready()) return ESP_ERR_INVALID_STATE;
+    FILE *file = fopen(BACKUP_TEMP, "wb");
+    if (!file) return ESP_FAIL;
+    return backup_write_stream(file, true);
+}
+
+// 内存导出：调用方拿到 malloc 的整段字节，长度由接收端随会话带过来。
+// Memory export: the caller owns the malloc'ed stream; the receiver learns its length
+// from the session announcement.
+esp_err_t app_settings_sync_export(uint8_t **data, size_t *length) {
+    if (!data || !length) return ESP_ERR_INVALID_ARG;
+    *data = NULL;
+    *length = 0;
+    char *buffer = NULL;
+    size_t size = 0;
+    FILE *file = open_memstream(&buffer, &size);
+    if (!file) return ESP_ERR_NO_MEM;
+    esp_err_t error = backup_write_stream(file, false);
+    if (error != ESP_OK || !buffer || !size) { free(buffer); return error == ESP_OK ? ESP_FAIL : error; }
+    *data = (uint8_t *)buffer;
+    *length = size;
     return ESP_OK;
 }
 
@@ -1304,17 +1354,10 @@ static bool backup_file_exists(const char *path, bool directory) {
     return stat(path, &st) == 0 && (directory ? S_ISDIR(st.st_mode) : S_ISREG(st.st_mode));
 }
 
-esp_err_t app_settings_backup_restore(void) {
-    if (!backup_card_ready()) return ESP_ERR_INVALID_STATE;
-    // 依次识别统一名与两板旧名，旧卡或换板后的备份可直接恢复。
-    // Accept the unified name and both legacy names so old cards and moved backups still restore.
-    const char *source = NULL;
-    FILE *file = NULL;
-    for (unsigned i = 0; i < sizeof(BACKUP_RESTORE_FILES) / sizeof(BACKUP_RESTORE_FILES[0]) && !file; ++i) {
-        source = BACKUP_RESTORE_FILES[i];
-        file = fopen(source, "rb");
-    }
-    if (!file) return ESP_ERR_NOT_FOUND;
+// 应用一个只读备份流：卡上的文件与内存里收到的一段字节走同一条校验/写入路径。
+// Apply one read-only backup stream; the card file and the received memory block share
+// this validation and write path.
+static esp_err_t backup_apply_stream(FILE *file) {
     settings_backup_v1_t backup;
     bool ok = fread(&backup, 1, sizeof(backup), file) == sizeof(backup);
     unsigned version = ok ? backup_version(&backup) : 0;
@@ -1396,16 +1439,29 @@ esp_err_t app_settings_backup_restore(void) {
     reader_controls_normalize(&controls);
     settings_backup_shelf_t shelf=backup_shelf_make((profile.home_full_refresh&4)?1:0,true);
     if(ok&&version>=25)ok=fread(&shelf,1,sizeof(shelf),file)==sizeof(shelf)&&backup_shelf_valid(&shelf);
+    settings_backup_hold_t guide={0};
+    if(ok&&version>=26)ok=fread(&guide,1,sizeof(guide),file)==sizeof(guide)&&backup_guide_valid(&guide);
     bool has_history = ok && version >= 6;
     if (has_history) {
         history_position = ftell(file);
         ok = history_position >= 0 && book_history_backup_validate(file);
     } else if (ok) ok = fgetc(file) == EOF && !ferror(file);
-    if (fclose(file) != 0) ok = false;
     if (!ok || !backup_valid(&backup)) {
         backup_erase_secret(&wifi, sizeof(wifi));
         return ESP_ERR_INVALID_RESPONSE;
     }
+
+#ifdef ESP_PLATFORM
+    // 先确认阅读记录可写，再改配置；避免恢复进行一半才遇到延迟挂载内存不足。
+    // Preflight storage before changing settings, rather than failing midway through history restore.
+    if (has_history) {
+        esp_err_t storage = book_progress_prepare_storage();
+        if (storage != ESP_OK) {
+            backup_erase_secret(&wifi, sizeof(wifi));
+            return storage;
+        }
+    }
+#endif
 
     if(version<20) {
         int px=version<19?(int)backup.flags[BK_TRACKING]*2-4:(int)backup.flags[BK_TRACKING]-4;
@@ -1500,6 +1556,7 @@ esp_err_t app_settings_backup_restore(void) {
 #undef BACKUP_SET_STR
     if(err==ESP_OK)err=nvs_set_blob(h,"rd_controls",&controls,sizeof(controls));
     if(err==ESP_OK)err=nvs_set_u8(h,"shelf_badges",shelf.badges);
+    if(err==ESP_OK)err=nvs_set_u8(h,NVS_KEY_BOOK_RULE_SAVED,guide.action);
     if (err == ESP_OK) err = nvs_commit(h);
     nvs_close(h);
     if (err != ESP_OK) { backup_erase_secret(&wifi, sizeof(wifi)); return err; }
@@ -1542,6 +1599,7 @@ esp_err_t app_settings_backup_restore(void) {
     s_book_indent_adjust = adjust.encoded;
     s_book_reading_line = f[BK_READING_LINE] % 3;
     s_book_rule_full = version >= 21 && f[BK_READING_LINE] >= 3;
+    s_book_rule_saved=guide.action;
     s_book_rule_offset = rule_offset;
     s_book_line = f[BK_LINE_SPACING];
     s_book_margin = f[BK_MARGIN];
@@ -1557,11 +1615,10 @@ esp_err_t app_settings_backup_restore(void) {
     strlcpy(s_wallpaper, backup.wallpaper, sizeof(s_wallpaper));
     strlcpy(s_bookmark,bookmark.path,sizeof(s_bookmark));
     if (has_history) {
-        file = fopen(source, "rb");
-        if (!file) { backup_erase_secret(&wifi, sizeof(wifi)); return ESP_FAIL; }
+        // 同一个只读流回到阅读记录段，不再按路径重开。
+        // Rewind the same read-only stream to the history section instead of reopening by path.
         esp_err_t history_err = fseek(file, history_position, SEEK_SET) == 0
             ? book_history_backup_restore(file) : ESP_FAIL;
-        if (fclose(file) != 0 && history_err == ESP_OK) history_err = ESP_FAIL;
         if (history_err != ESP_OK) { backup_erase_secret(&wifi, sizeof(wifi)); return history_err; }
     }
     if (has_wifi) {
@@ -1570,4 +1627,30 @@ esp_err_t app_settings_backup_restore(void) {
         if (wifi_err != ESP_OK) return wifi_err;
     }
     return ESP_OK;
+}
+
+esp_err_t app_settings_backup_restore(void) {
+    if (!backup_card_ready()) return ESP_ERR_INVALID_STATE;
+    // 依次识别统一名与两板旧名，旧卡或换板后的备份可直接恢复。
+    // Accept the unified name and both legacy names so old cards and moved backups still restore.
+    FILE *file = NULL;
+    for (unsigned i = 0; i < sizeof(BACKUP_RESTORE_FILES) / sizeof(BACKUP_RESTORE_FILES[0]) && !file; ++i)
+        file = fopen(BACKUP_RESTORE_FILES[i], "rb");
+    if (!file) return ESP_ERR_NOT_FOUND;
+    esp_err_t error = backup_apply_stream(file);
+    if (fclose(file) != 0 && error == ESP_OK) error = ESP_FAIL;
+    if (error != ESP_OK) ESP_LOGW(TAG, "configuration restore: %s", esp_err_to_name(error));
+    return error;
+}
+
+// 内存导入：对端整段字节先进只读 memstream，再走与卡上恢复相同的校验。
+// Memory import: wrap the peer's bytes in a read-only memstream and validate as a card restore.
+esp_err_t app_settings_sync_import(const uint8_t *data, size_t length) {
+    if (!data || !length) return ESP_ERR_INVALID_ARG;
+    FILE *file = fmemopen((void *)data, length, "rb");
+    if (!file) return ESP_ERR_NO_MEM;
+    esp_err_t error = backup_apply_stream(file);
+    if (fclose(file) != 0 && error == ESP_OK) error = ESP_FAIL;
+    if (error != ESP_OK) ESP_LOGW(TAG, "configuration restore: %s", esp_err_to_name(error));
+    return error;
 }

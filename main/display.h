@@ -63,6 +63,11 @@ enum EpdDrawError update_display_fast_page(EpdiyHighlevelState* hl);
 /// Arm fixed navigation for the next main-screen output; tag shelf exit and actual navigation so same-page repaints do not animate.
 void display_main_transition_arm(const void* owner, bool leaving_shelf, bool changing_page);
 #if KIIKO_BOARD_METALIO47
+#include "display_reader_waveform.h"
+/// 阅读专用灰阶输出，full仅用于收起归一或区域定稿；保留供电检查和Flash互斥。
+/// Reader-private gray output; full is for dismissal normalization/settling, retaining power checks and Flash exclusion.
+enum EpdDrawError update_display_reader_gray(EpdiyHighlevelState* hl, EpdRect area,
+    display_reader_gray_profile_t profile, bool full);
 /// 仅真实快刷跨主页的背景擦白许可；调用后须恢复原值。/ Scoped fast root background permission; restore after presentation.
 bool display_main_fast_background_set(bool active);
 /// Scope extra white erasure to an actual switch between visible main tabs; returns the previous scope.
@@ -155,12 +160,18 @@ enum EpdDrawError update_display_water_turn(EpdiyHighlevelState* hl, EpdRect are
 /// 同步普通文字翻页沿用水波纹的全部灰阶相位，单带同时输出并恢复原节拍。/ Ordinary text uses all ripple gray phases in one synchronous band and restores pacing.
 enum EpdDrawError update_display_text_turn(EpdiyHighlevelState* hl, EpdRect area, e0470_turn_dir_t dir);
 #if KIIKO_BOARD_METALIO47
+/// 图文翻页保留完整灰阶，使用单带预填或八带水波纹。/ Image turns retain full grays with single-band prefill or eight ripple bands.
+enum EpdDrawError update_display_image_turn(EpdiyHighlevelState* hl, EpdRect area,
+                                           e0470_turn_dir_t dir, bool ripple);
 /// S31图文：同色保持，实际灰阶迁移用完整灰阶，黑白目标用原厂DU20，不量化图片。
 /// S31 images: hold equal pixels; retain complete gray transitions or native DU20 for actual BW changes, without quantization.
 enum EpdDrawError update_display_gray_transition(EpdiyHighlevelState* hl, EpdRect area);
 #endif
 
 #if KIIKO_BOARD_METALIO47
+/// 目录内翻页与分卷展开走 GL37 精确差分，沿用整页清残影计数。
+/// TOC paging and volume expansion use exact GL37 differences with the existing page cleanup cadence.
+enum EpdDrawError update_display_toc_page(EpdiyHighlevelState* hl);
 /// 已验证未变正文上的面板：保留原厂GL48及完整目标灰阶，一次区域定稿；不借文字22相或速读黑白。
 /// Panels over verified unchanged text retain vendorGL48/full target grays in one regional settle, independent of text22-phase/FastBW.
 enum EpdDrawError update_display_reader_panel(EpdiyHighlevelState* hl,EpdRect area);
@@ -180,8 +191,14 @@ int display_pclk_mhz(void);
 /// On underrun, drop to the safe clock and full-refresh; other error bits are ignored.
 void guard_draw_result(EpdiyHighlevelState* hl, enum EpdDrawError result);
 
-/// 根页切换补白许可：0关闭、6普通、8涉及书架，仅在一次真实根页推屏中生效并恢复。
-/// Scope board root whitening:0 off,6 ordinary,8 involving the shelf; restore the prior value after presentation.
+#if !KIIKO_BOARD_METALIO47
+/// PICO 阅读分区独立提交，防止对齐跨过正文和信息栏的边界。/ Present Pico reader regions without aligning into neighboring chrome.
+enum EpdDrawError update_display_reader_area(EpdiyHighlevelState *hl,
+    const EpdWaveform *wave, enum EpdDrawMode mode, EpdRect area, bool full);
+#endif
+
+/// 根页切换补白许可：0关闭、6普通、8涉及书架，PICO快刷为10，仅在一次推屏中生效并恢复。
+/// Scope board root whitening:0 off,6 ordinary,8 involving the shelf,10 for Pico fast switches; restore the prior value after presentation.
 unsigned display_main_quality_set(unsigned white_phases);
 
 #ifdef __cplusplus

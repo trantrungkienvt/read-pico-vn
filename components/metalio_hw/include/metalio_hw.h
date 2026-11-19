@@ -26,6 +26,8 @@ bool metalio_key_down(void);
 /// 两次有效P17低电平才确认电源键；共享GPIO2中断或读失败不能确认。
 /// Confirm power only after two valid low P17 samples; shared GPIO2 or failed reads are insufficient.
 bool metalio_confirm_power_key(void);
+/// 浅睡返回后立即读P17，两次低电平才确认。/ On light-sleep return, require two immediate P17 low samples.
+bool metalio_confirm_light_wake_key(void);
 /// 深睡启动硬件初始化时确认的真实按键。/ Real key confirmed early during deep-boot hardware initialization.
 bool metalio_boot_power_key(void);
 /// Consume optional one-use bootloader P17 evidence before loading UI/media.
@@ -45,6 +47,9 @@ esp_err_t metalio_tps_on(int vcom_mv);
 esp_err_t metalio_tps_prepare(void);
 void metalio_tps_cancel_prepare(void);
 void metalio_tps_off(void);
+/// P00–P02 与 PGOOD 全低才确认断电，TPS 已被重新启用时返回 ESP_ERR_INVALID_STATE。
+/// Confirm power-off from P00–P02 and PGOOD; return ESP_ERR_INVALID_STATE if TPS is active or preparing.
+esp_err_t metalio_tps_verify_off(void);
 bool metalio_tps_ready(void);
 /// 读 TPS65185 的 VCOM 寄存值；断电后返回最近成功回读，失败 -1。这不是电压表测量。
 /// Read VCOM registers (10mV/LSB); retain the last successful read while powered off, -1 on failure. Not a voltage measurement.

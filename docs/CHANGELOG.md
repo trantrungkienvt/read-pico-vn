@@ -1,5 +1,117 @@
 # 版本变更 / Changelog
 
+## 本地测试 / Local test — 2026-11-19（Pico 保轨）
+
+- Pico 高压轨空闲保留时间由 8 秒延长到 30 秒，减少反复放电/上电次数，改善阳光下淡墨与连续翻页的一致性；像素驱动仍在每轮输出后立即释放。
+- Pico keeps the HV rails for thirty seconds instead of eight between outputs, cutting repeated discharge/power-up cycles and improving sunlight density and consecutive-turn consistency; pixel drive still releases after each output.
+
+## 本地测试 / Local test — 2026-11-19（Pico 翻页信息栏）
+
+- Pico 每次翻页后只把顶部状态栏与底部进度条的白底再退一次白，未变化的文字和图形保持不动；普通翻页本身仍整屏推白。
+- After each Pico turn only the white background of the status row and progress bar is pushed white again; unchanged text and graphics are held. Ordinary turns still push the whole panel white.
+
+## S31 0.3.3-rc116 — 2026-11-19
+
+- 优化 TXT/EPUB 章节识别、题头样式、卷页与章节分页，修复章首和段落异常留白。
+- 修复后续页章名显示，保留精排 EPUB 的图片、题头及自带格式。
+- 修复阅读线手势，新增保存格式，开关恢复样式、范围和位置。
+- 优化大书分段加载、插图内存管理与异常开书恢复。
+- 优化阅读进度存储，修复票根及拼贴锁屏的 TXT 封面。
+- 新增设备间设置和阅读资料同步。
+- 优化普通和水波纹翻页、工具栏与目录刷新，减少多余全刷，修复启动重启。
+
+## PICO 0.3.3-rc109 / S31 0.3.3-rc115 — 2026-11-19
+
+- 优化 TXT/EPUB 章节识别、题头样式、卷页与章节分页，修复章节首页和段落异常留白；精排 EPUB 优先保留自带格式。
+- 修复后续页章名显示和阅读线手势，新增「保存阅读线格式」。
+- 优化大书分段加载、插图内存管理、异常开书恢复及阅读进度存储。
+- 修复票根及拼贴锁屏的 TXT 封面，新增设备间设置与阅读资料同步。
+- S31 优化普通、水波纹、工具栏与目录刷新，减少重复全刷，修复启动循环重启。
+
+## 本地测试 / Local test — 2026-11-19
+
+- 两款机型修复章节首页提前截断正文、底部异常留白；全屏下使用完整正文区域，工具栏显隐保持分页及阅读位置。
+- Both boards fix prematurely shortened chapter-opening pages and unused space below the text. Chapter starts use the complete body, with pagination and source positions retained across toolbar visibility changes.
+- 两款机型修复触摸手势的阅读线开关；新增「保存阅读线格式」，一键恢复已保存的样式、范围和上下位置，支持重启、备份和设备同步。
+- Both boards fix reading-guide gesture toggles and add Save reading guide format. The saved style, span and position survive restarts, backups and device sync.
+
+- 两款机型的章节题头按实际高度加一行正文间距，不再按双行设计框整块留白；无书内样式的空白段不与阅读段距叠加，修正首段、第二段之间异常大空隙，保留原书明确样式。
+- Both boards reserve measured chapter headings plus one body row instead of a fixed two-row canvas. Unstyled source blanks no longer stack with reader paragraph spacing,fixing excessive gaps between opening paragraphs while preserving authored layouts.
+
+- S31阅读水波纹使用四带错相、尾两带合并，纯文字扫描由44拍减至39拍，保留37相GL16完整灰阶与正文局刷。插图40→35拍、背景36→31拍；普通翻页、主页、设置列表及PICO保持原样。
+- S31 reader ripple uses four staggered bands with a paired tail, reducing text scans from44 to39 ticks while retaining all37 GL16 phases and body-only crops. Art40→35,background36→31; ordinary turns,main pages,settings lists andPICO retain their profiles.
+
+- S31纯文字水波纹保持重合黑字和灰边，目标白色在尾部三拍补白、最后一拍保持，整理旧字残影与空白区域。继续37相GL16、39拍，非白目标及普通/插图/背景原表保持。残影与过渡观感待实机验收。
+- S31 text ripple holds overlapping black/grays,reinforces white targets in three tail phases and holds the final phase to settle erased text and blank areas. Keep37-phase GL16 over39 ticks,nonwhite transitions and ordinary/art/background tables; optical acceptance remains pending.
+
+## 本地测试 / Local test — 2026-11-18
+
+- Pico 普通翻页改为整屏推白并重推黑：顶部状态栏、书名与底部章节/进度一起擦白；波形把厂商定稿保持挪到擦白之前，重推黑作为最后一段驱动，减少阳光下黑字发灰。
+- Pico ordinary turns push white and re-drive black across the whole panel, status bar and footer included; the waveform runs the vendor settle holds before the erase and ends on the black re-drive so blacks stay dense in sunlight.
+
+- 两款机型不再给目录、版权、序言等书前资料套章节题头。阅读器生成的卷名居中独占一页，下一章新页；分开的卷号/章号与副题合排，保留原书精排、卷后正文和偏移。页脚在后续页继续显示实际章名，仅有章号时不再显示为空。
+- Both boards exclude front matter from reader heading styles. Reader-generated volume dividers center on a separate page, chapters start afresh, and adjacent number/subtitle blocks compose together while retaining authored layouts, intervening prose and offsets. Continuation-page footers resolve the current chapter and keep number-only labels.
+- 阅读设置里的「全屏沉浸」改名为「关闭上下状态栏」，保留原有开关行为。
+- Rename the reader's immersive toggle to “Hide top and bottom bars” without changing its behavior.
+
+- S31 普通翻页提前灰边的有效驱动，保留完整灰阶与脉冲数量；水波纹只扫描正文，状态栏与进度单独局刷。进入阅读和目录返回正文统一一次黑白全刷，保留首帧灰阶。默认 VCOM 改为 −1500 mV。
+- S31 ordinary turns advance gray-edge drive without reducing gray levels or pulse counts. Ripple scans only the body, with independent local status/progress updates. Reader entry and TOC return use one black/white full refresh with source grays retained. Default VCOM is −1500 mV.
+
+- S31 普通阅读采用 37 相 GL16 差分，水波纹使用完整灰阶与八带逐拍启动；背景和插图使用独立灰阶派生表。阅读工具栏和设置改为局部差分，滑块在自身区域刷新，收起面板后统一文字墨度。保留有效的逐机 VCOM 标定。主页和系统设置列表的刷新保持原样。
+- S31 ordinary reading uses 37-phase GL16 differences, with full-gray ripple launching eight bands one per tick and separate background/illustration derivatives. Reader tools and settings update locally, sliders refresh their own rectangles, and dismissal normalizes text ink. Valid per-device VCOM calibration is retained. Main-page and system-list refresh profiles remain unchanged.
+
+- S31 构建补齐双核 Flash 缓存保护，在另一核报告就绪前暂停分支预测，缓存恢复后再开启，修复启动读取设置时的缓存异常和循环重启。
+- S31 builds guard the parked core's branch predictor before flash cache suspension and restore it after cache resumes, addressing cache panics and reboot loops while loading settings.
+
+## 本地测试 / Local test — 2026-11-17
+
+- 设置「连接与时间」新增设备同步：两台设备进入同一页，一台选发射、一台选接收，扫描后自动选中对端并显示四位配对码；接收端确认后经 ESP-NOW 分片同步排版、阅读进度、书签与已存 WiFi，整段校验通过才写入并重启。
+- Settings → Connection & time gains Device sync: both devices open the page, one sends and the other receives, the first peer is selected automatically and a four-digit pairing code is shown; after the receiver confirms, layout, reading progress, bookmarks and saved WiFi move over ESP-NOW in checked chunks and are applied only after the whole stream validates, then the receiver restarts.
+
+- S31 普通文字翻页使用原厂 GL37 白转中灰序列，空白补白与落字同时进行，补黑与退白重叠，扫描共 49 相。相间预填保留 192 行和 12 ms 节拍下限，发生欠载时清屏恢复并回退供数。水波纹各条带的空白与新字一起刷新。
+- S31 ordinary text turns use vendor GL37 white-to-midgray transitions, driving blank whites alongside text and overlapping black reinforcement with white erasure for 49 phases. Inter-phase prefill retains 192 lines and a 12 ms cadence floor, with panel recovery and fallback on underruns. Ripple bands drive blank whites together with new text.
+
+- S31 目录内翻页、展开和收起卷使用 37 相 GL16 差分。原有周期全刷清残影照常进行。
+- S31 uses 37-phase GL16 differential refresh for TOC paging and volume expansion or collapse. Existing periodic full cleanup still applies.
+
+- 两款机型打开 TXT 或 EPUB 时局刷「正在打开书籍」。精排 EPUB 保留原书章首图片与题头的顺序及对齐，固件题头从新页第二行开始。
+- Both boards show an opening notice before loading TXT or EPUB files. Styled EPUBs preserve the ordering and alignment of chapter artwork and headings. Reader-generated headings start on the second line of a new page.
+
+- S31 恢复较快的普通翻页波形。正文灰边按二维位置分配 4 位灰阶舍入，正立字形直接写入屏幕缓冲，命中预绘缓存时复用正文并只绘一次状态栏。
+- S31 restores the faster ordinary-turn waveform. Body glyphs distribute 4-bit edge rounding spatially, upright glyphs write directly to the framebuffer, and cached turns paint the status row once.
+
+- 两款机型自动加载当前阅读页的 EPUB 插图，按可用内存限制解码。扉页横线随实际题头长度。S31 普通翻页恢复完整灰阶字边，四级灰阶仅用于水波纹试验路径。
+- EPUB illustrations load automatically within a memory budget on both boards. The horizontal flyleaf rule follows the typeset heading. S31 ordinary turns retain full glyph edge grays, with the four-level experiment limited to ripple turns.
+
+- 两款机型的票根和拼贴锁屏读取 TF 已下载的 TXT 封面。拼贴缓存随下载封面变化自动更新。
+- Ticket and collage lockscreens on both boards display downloaded TXT artwork from the TF card. Collage caches follow the downloaded cover identity.
+
+## 本地测试 / Local test — 2026-11-16
+
+- PICO 和 S31 对超长 EPUB XHTML 章节按段解压、排版，翻到边界时加载下一段。保留目录链接和整章进度位置。题头默认大小为 150%。
+- Both boards open long EPUB XHTML chapters in bounded sections and load the next section at the page boundary, retaining navigation and chapter-relative progress. The chapter heading defaults to 150%.
+
+- PICO 与 S31 返回首页时结束中断开书的恢复模式，随后正常加载已选字体。仍跳过中断书的自动续读和封面解析。
+- PICO and S31 leave interrupted-book recovery on navigation and load the selected fonts again. Automatic resume and cover parsing still skip the interrupted book.
+- 逐本阅读进度迁至内置数据分区。读回校验后才释放旧 NVS 条目，TF 阅读资料备份也会包含迁移后的进度。
+- Per-book progress moves to internal data storage. Legacy NVS entries are removed after read-back verification, and TF history backups include migrated progress.
+- PICO 与 S31 的「阅读设置 → 排版 → 章节题头」新增居中短线、左齐细线和章号侧栏，支持 EPUB 横排和竖排，选择会在重启后保留。
+- On PICO and S31, choose Centered, Left rule or Number rail under Reading settings → Layout → Chapter heading. The choice applies to horizontal and vertical EPUB text and persists after restart.
+- TXT 识别到的章名沿用题头样式。EPUB 优先保留书内明确设置的题头格式，无专门格式时使用阅读设置中的样式。
+- Detected TXT headings use the selected heading style. EPUB uses explicitly authored heading formatting when present and falls back to the reader's style.
+- 章节题头用黑色分隔线，选择页并列展示样式示例。Wi‑Fi 空闲两分钟后关闭。状态栏按开关显示 Wi‑Fi 和蓝牙图标。
+- Chapter heading separators are black, and the picker previews each style. Wi-Fi turns off after two idle minutes. The status bar shows enabled Wi-Fi and Bluetooth radios.
+
+## 小纸 PICO 0.3.3-rc108 / Metalio S31 0.3.3-rc114 — 2026-11-16
+
+- **双机型**：提前准备书架首页，进入书架后继续预热后续页。缓存封面整页显示，切页和开书可打断后台工作。
+- **双机型**：书架管理新增一键获取 TXT 封面。支持微信读书和 Z-Library、模糊匹配、手选候选小图及 TF 卡缓存。缺少封面时使用统一的书名封面。
+- **双机型**：票根读取实际章节位置，按正文停留时间统计阅读时长。阅星瞳导入校验 TXT 完整性，开书异常后跳过该书自动续读。
+- **PICO**：阅读页脚页码使用局部刷新，继续阅读模块去掉浅灰背景。
+- **S31**：短锁屏保留 TF 挂载，浅睡唤醒集中恢复，按设置单击或双击唤醒，并沿用 RC113 的翻页参数。修复获取封面时的 Wi-Fi 重启和 HTTPS 收包失败。
+
+Both boards prewarm shelf pages, batch ready cover updates, fetch TXT covers from WeRead and Z-Library, cache selections on the TF card, and align ticket chapters and reading time with the reader. PICO refreshes page numbers locally. S31 retains TF mounts during brief locks, applies the configured wake gesture, keeps RC113 page-turn settings, and improves cover-fetch network stability.
+
 ## Metalio S31 0.3.3-rc113 — 2026-11-12
 
 - 修复首次进入书架时只显示底部封面、加载提示停留的问题。书架先显示书名和已就绪的封面，后台完成一批就补画一批，加载结束后自动清除提示。

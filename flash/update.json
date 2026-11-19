@@ -1,12 +1,12 @@
 {
   "schema": 1,
-  "version": "0.3.3-rc107",
+  "version": "0.3.3-rc109",
   "project": "Read_Pico",
   "board": "RDP-G01-W",
   "layout": "pico-dual-4m-v1",
   "minimum_base_version": "0.3.3-rc72",
-  "url": "https://wegooo-cell.github.io/read-pico-reader/Pico-update-0.3.3-rc107.bin",
-  "size": 4133056,
-  "sha256": "4d74d7b5687e621a6b7483834083eea50d7c9f26bd04f54ca39644a209f2b8de",
-  "notes": "设置列表快滑松手直接滚动约半屏，松手后立即清理残影。\n阅读缓存迁入 .kiikoread 目录。\n阅读和主页切换恢复 RC104 刷新方式。\n锁屏浅睡前确认屏幕断电，未通过时重试。"
+  "url": "https://wegooo-cell.github.io/read-pico-reader/Pico-update-0.3.3-rc109.bin",
+  "size": 4193792,
+  "sha256": "e992d026f7c13a9a32217550f2590a8414248e0f02a8b603f39f71267436f7ed",
+  "notes": "优化章节题头、卷页、章首留白及页脚章名；修复阅读线手势并新增保存格式；优化大书加载、异常恢复及进度存储；新增设备同步。"
 }

@@ -19,8 +19,7 @@ typedef struct {
     uint8_t *pixels;
     unsigned width,height;
     bool fast,white_edge;
-    /// 由标题生成的默认封面；不得进入整页书架缓存，否则失败会被固化。
-    /// Generated default cover; never enters the whole-page shelf cache or a failure freezes.
+    /// 由标题生成的默认封面 / A default cover generated from the title.
     bool generated;
     bool metadata;uint16_t chapters; ///< 来源校验后的章节数 / Source-validated chapter total
     off_t size;
@@ -31,7 +30,11 @@ unsigned book_cover_jobs_begin(void);
 bool book_cover_jobs_submit(unsigned generation,unsigned slot,const book_cover_job_t *request);
 /// 0待处理，1完成并转交像素所有权，-1失败；无封面时仅在UI生成字形。
 /// 0 pending,1 transfers pixels,-1 failed; missing artwork renders its glyphs only on the UI thread.
+/// A readable book has no embedded artwork, so keep its title card.
+enum { BOOK_COVER_JOB_NO_ARTWORK = -2 };
 int book_cover_jobs_take(unsigned generation,unsigned slot,book_cover_result_t *result);
+/// Collect finished work without rendering automatic covers on the caller.
+int book_cover_jobs_take_ready(unsigned generation, unsigned slot, book_cover_result_t *result);
 void book_cover_jobs_cancel(unsigned generation);
 /// 仅卸载/睡眠前收齐文件句柄，导航不等待。/ Join handles only before unmount/sleep; navigation never waits.
 bool book_cover_jobs_quiesce(unsigned timeout_ms);

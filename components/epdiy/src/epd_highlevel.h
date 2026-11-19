@@ -144,9 +144,24 @@ enum EpdDrawError epd_hl_update_area(
     EpdiyHighlevelState* state, enum EpdDrawMode mode, int temperature, EpdRect area
 );
 
+/// 阅读差分可选外扩一行/一列字节，参数仅0或1，驱动不越过原裁剪。
+/// Reader differences may expand one line/column-byte (0 or1 only), without driving beyond the requested crop.
+enum EpdDrawError epd_hl_update_area_padded(EpdiyHighlevelState *state, enum EpdDrawMode mode,
+    int temperature, EpdRect area, int pad_lines, int pad_cols);
+
 /// 区域内强制脏行/脏列，未变化的白像素也会走 LUT（GL16 白底补推用）。
 enum EpdDrawError epd_hl_update_area_full(
     EpdiyHighlevelState* state, enum EpdDrawMode mode, int temperature, EpdRect area
+);
+
+/// 只提交原矩形内的差异。/ Drive and commit differences within the exact requested rectangle.
+enum EpdDrawError epd_hl_update_area_diff_exact(
+    EpdiyHighlevelState *state, enum EpdDrawMode mode, int temperature, EpdRect area
+);
+
+/// 区域全刷，掩码和后缓冲提交都限定在原矩形。/ Force full drive and commit strictly within the original rectangle.
+enum EpdDrawError epd_hl_update_area_full_exact(
+    EpdiyHighlevelState *state, enum EpdDrawMode mode, int temperature, EpdRect area
 );
 
 /**

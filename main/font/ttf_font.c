@@ -266,10 +266,7 @@ typedef struct {
     glyph_entry_t* f_lru_head;
     glyph_entry_t* f_lru_tail;
     size_t f_cache_bytes;
-#if KIIKO_BOARD_METALIO47
-    bool f_preview;        ///< 临时名称预览不映射整份 glyf/gvar / transient names never map full outline tables
-#else
-#endif
+    bool f_preview;        ///< 临时字体不映射整份轮廓 / transient faces do not map full outlines
     bool f_used;           ///< 槽位已被占用 / the slot is in use
 } ttf_slot_t;
 
@@ -2528,22 +2525,14 @@ static esp_err_t load_opened_font(void) {
 
     // CFF 没有 glyf 表，长度为零，不必去映射。
     // A CFF face has no glyf table; its length is zero and there is nothing to map.
-#if KIIKO_BOARD_METALIO47
     if (file_glyf_len && !s_cur->f_preview) {
-#else
-    if (file_glyf_len) {
-#endif
         try_map_table(
             file_glyf_off, file_glyf_len, &glyf_ram, &glyf_ram_off, &glyf_ram_len, "glyf"
         );
     }
 
     load_variation(header, sizeof(header));
-#if KIIKO_BOARD_METALIO47
     if (gvar_ready && file_gvar_len > 0 && !s_cur->f_preview) {
-#else
-    if (gvar_ready && file_gvar_len > 0) {
-#endif
         try_map_table(
             file_gvar_off, file_gvar_len,
             &gvar_ram, &gvar_ram_off, &gvar_ram_len, "gvar"
@@ -2847,9 +2836,9 @@ esp_err_t ttf_font_open(const char* path) {
     s_cur_index = keep;
     s_cur = &s_slots[keep];
     return err;
-#if KIIKO_BOARD_METALIO47
 }
 
+#if KIIKO_BOARD_METALIO47
 struct ttf_font_prepared { ttf_slot_t face, scratch; };
 static void unload_prepared_here(void) {
     unload_here();
@@ -2913,24 +2902,25 @@ void ttf_font_prepared_free(ttf_font_prepared_t *prepared) {
     heap_caps_free(prepared);
 }
 
-// 名称预览只借空闲书内字体槽，不替换活动阅读字体；槽满就由界面回退普通标签。
-// Name previews borrow an empty embedded slot without replacing the reader face; full slots use a UI label.
-bool ttf_font_draw_preview(const char *path, uint8_t *fb, int x, int y, int px,
-                           const char *text, int width) {
-    if (!path || !fb || !text || !*text || width <= 0) return false;
+#endif
+
+// 只在当前绘制期间借空槽，保留活动字体和书内字体的游标。/ Borrow an empty slot for the draw and restore the previous face and runs.
+bool ttf_font_draw_with_path(const char *path, ttf_face_draw_fn draw, void *context) {
+    if (!path || !draw) return false;
     ttf_font_slots_init();
     int slot = TTF_FONT_SLOT_SYSTEM;
-    bool borrowed = !ttf_font_ready() || strcmp(path, ttf_font_path());
+    const bool borrowed = !ttf_font_ready() || strcmp(path, ttf_font_path());
     if (borrowed) {
         for (slot = TTF_FONT_SLOT_SYSTEM + 1; slot < TTF_FONT_SLOTS; ++slot)
             if (!s_slots[slot].f_used) break;
         if (slot == TTF_FONT_SLOTS) return false;
     }
-    int saved_weight = s_slots[slot].f_weight;
-    int keep = slot_lend(slot);
+    const int saved_weight = s_slots[slot].f_weight;
+    const int keep = slot_lend(slot);
     const ttf_run_t *saved_runs = s_draw_runs;
-    size_t saved_run_count = s_draw_run_count;
-    s_draw_runs = NULL; s_draw_run_count = 0;
+    const size_t saved_run_count = s_draw_run_count;
+    s_draw_runs = NULL;
+    s_draw_run_count = 0;
     bool ok = true;
     if (borrowed) {
         unload_here();
@@ -2940,29 +2930,47 @@ bool ttf_font_draw_preview(const char *path, uint8_t *fb, int x, int y, int px,
         font_fd = open_font_file(path);
         ok = font_fd >= 0 && ensure_work() && load_opened_font() == ESP_OK;
     }
-    if (ok) {
-        ok = ttf_font_slot_has_text(slot, text);
-        if (ok) {
-            while (px > 12 && ttf_text_width_px(px, text) > width) --px;
-            int above = 0, below = 0;
-            ttf_measure_line_px(px, text, &above, &below);
-            ttf_draw_text_px(fb, x, y + (above - below) / 2, px, text,
-                             EPD_DRAW_ALIGN_CENTER, 0, 15);
-        }
-    }
+    if (ok) ok = draw(context);
     if (borrowed) {
+        slot_lend(slot);
         unload_here();
         heap_caps_free(s_cur->f_io_data);
         heap_caps_free(s_cur->f_io_run_buf);
         slot_init(s_cur);
         s_cur->f_weight = saved_weight;
     }
-    s_draw_runs = saved_runs; s_draw_run_count = saved_run_count;
+    s_draw_runs = saved_runs;
+    s_draw_run_count = saved_run_count;
     slot_restore(keep);
     return ok;
-#else
-#endif
 }
+
+#if KIIKO_BOARD_METALIO47
+typedef struct {
+    uint8_t *fb;
+    int x, y, px, width;
+    const char *text;
+} font_preview_t;
+
+static bool draw_preview(void *context) {
+    const font_preview_t *preview = context;
+    if (!ttf_font_slot_has_text(ttf_font_selected(), preview->text)) return false;
+    int px = preview->px;
+    while (px > 12 && ttf_text_width_px(px, preview->text) > preview->width) --px;
+    int above = 0, below = 0;
+    ttf_measure_line_px(px, preview->text, &above, &below);
+    ttf_draw_text_px(preview->fb, preview->x, preview->y + (above - below) / 2, px,
+                     preview->text, EPD_DRAW_ALIGN_CENTER, 0, 15);
+    return true;
+}
+
+bool ttf_font_draw_preview(const char *path, uint8_t *fb, int x, int y, int px,
+                           const char *text, int width) {
+    if (!fb || !text || !*text || width <= 0) return false;
+    font_preview_t preview = {fb, x, y, px, width, text};
+    return ttf_font_draw_with_path(path, draw_preview, &preview);
+}
+#endif
 
 esp_err_t ttf_font_init(void) {
     ttf_font_slots_init();
@@ -3044,6 +3052,47 @@ static bool s_antialias = true;
 void ttf_set_antialias(bool enabled) { s_antialias = enabled; }
 bool ttf_get_antialias(void) { return s_antialias; }
 
+#if KIIKO_BOARD_METALIO47 && defined(ESP_PLATFORM)
+static bool s_reader_body_aa;
+static uint8_t s_reader_gray[4][256];
+
+void ttf_set_reader_body_aa(bool enabled) { s_reader_body_aa = enabled; }
+
+static void reader_gray_rebuild(void) {
+    // Distribute rounding across a 2x2 cell, preserving solid ink and paper.
+    static const uint8_t thresholds[4] = {31, 159, 223, 95};
+    for (unsigned i = 0; i < 4; ++i)
+        for (unsigned alpha = 0; alpha < 256; ++alpha)
+            s_reader_gray[i][alpha] = 15 - (s_cover[alpha] * 15u + thresholds[i]) / 255u;
+}
+
+static inline uint8_t reader_gray_at(uint8_t alpha, int x, int y) {
+    return s_reader_gray[((y & 1) << 1) | (x & 1)][alpha];
+}
+
+// Clip and rotate a glyph once. Each logical column is a contiguous physical row.
+static void blit_reader_portrait(uint8_t *fb, int left, int top, const glyph_entry_t *glyph) {
+    const int width = epd_width(), height = epd_height();
+    const int x0 = left < 0 ? 0 : left;
+    const int x1 = left + glyph->width < height ? left + glyph->width : height;
+    const int y0 = top < 0 ? 0 : top;
+    const int y1 = top + glyph->height < width ? top + glyph->height : width;
+    if (x0 >= x1 || y0 >= y1) return;
+    const int stride = width / 2;
+    for (int x = x0; x < x1; ++x) {
+        uint8_t *row = fb + (size_t)(height - 1 - x) * stride;
+        int source = (y0 - top) * glyph->width + x - left;
+        for (int y = y0; y < y1; ++y, source += glyph->width) {
+            uint8_t gray = reader_gray_at(glyph->bitmap[source], x, y);
+            if (gray == 15) continue;
+            uint8_t *pixel = row + y / 2;
+            if (y & 1) *pixel = (*pixel & 0x0f) | (gray << 4);
+            else *pixel = (*pixel & 0xf0) | gray;
+        }
+    }
+}
+#endif
+
 /* ---- 绘制 / Draw ---- */
 static void ttf_cover_lut_rebuild(void) {
     for (int i = 0; i < 256; i++) {
@@ -3053,6 +3102,9 @@ static void ttf_cover_lut_rebuild(void) {
         if (v > 255) v = 255;
         s_cover[i] = (uint8_t)v;
     }
+#if KIIKO_BOARD_METALIO47 && defined(ESP_PLATFORM)
+    reader_gray_rebuild();
+#endif
     s_cover_ready = true;
 }
 
@@ -3061,9 +3113,43 @@ static void ttf_cover_lut_init(void) {
     ttf_cover_lut_rebuild();
 }
 
-static uint8_t mix_ink(uint8_t alpha, uint8_t fg, uint8_t bg) {
-    if (!s_antialias) return alpha >= 128 ? fg : bg;
+static inline uint8_t mix_ink_aa(uint8_t alpha, uint8_t fg, uint8_t bg, bool antialias) {
+    if (!antialias) return alpha >= 128 ? fg : bg;
     return (uint8_t)(bg + s_cover[alpha] * ((int)fg - (int)bg) / 255);
+}
+
+static uint8_t mix_ink(uint8_t alpha, uint8_t fg, uint8_t bg) {
+    return mix_ink_aa(alpha, fg, bg, s_antialias);
+}
+
+// 正立落字形：pen_x 是字身框左边缘，baseline 是框内基线。
+// Blit an upright glyph: pen_x is the em box's left edge and baseline its baseline inside it.
+static void blit_upright(uint8_t* framebuffer, int pen_x, int baseline,
+                         const glyph_entry_t* glyph, uint8_t fg, uint8_t bg, bool antialias) {
+    if (glyph->bitmap == NULL) return;
+#if KIIKO_BOARD_METALIO47 && defined(ESP_PLATFORM)
+    const bool reader_gray = s_reader_body_aa && antialias && fg == 0 && bg == 15;
+    if (reader_gray && epd_get_rotation() == EPD_ROT_INVERTED_PORTRAIT) {
+        blit_reader_portrait(framebuffer, pen_x + glyph->left, baseline - glyph->top, glyph);
+        return;
+    }
+#endif
+    for (int gy = 0; gy < glyph->height; gy++) {
+        int yy = baseline - glyph->top + gy;
+        for (int gx = 0; gx < glyph->width; gx++) {
+            uint8_t alpha = glyph->bitmap[gy * glyph->width + gx];
+            if (alpha == 0) continue;
+#if KIIKO_BOARD_METALIO47 && defined(ESP_PLATFORM)
+            if (reader_gray) {
+                int xx = pen_x + glyph->left + gx;
+                uint8_t gray = reader_gray_at(alpha, xx, yy);
+                if (gray != 15) epd_draw_pixel(xx, yy, gray << 4, framebuffer);
+                continue;
+            }
+#endif
+            epd_draw_pixel(pen_x + glyph->left + gx, yy, mix_ink_aa(alpha, fg, bg, antialias) << 4, framebuffer);
+        }
+    }
 }
 
 void ttf_draw_text(
@@ -3096,21 +3182,12 @@ void ttf_draw_text_px(
         const glyph_entry_t* glyph = get_glyph(cp, pixel_height);
         if (glyph == NULL) continue;
 
-        if (glyph->bitmap != NULL) {
-            for (int gy = 0; gy < glyph->height; gy++) {
-                int yy = y - glyph->top + gy;
-                for (int gx = 0; gx < glyph->width; gx++) {
-                    uint8_t alpha = glyph->bitmap[gy * glyph->width + gx];
-                    if (alpha == 0) continue;
-                    epd_draw_pixel(
-                        cursor_x + glyph->left + gx, yy, mix_ink(alpha, fg, bg) << 4, framebuffer
-                    );
-                }
-            }
-        }
+        blit_upright(framebuffer, cursor_x, y, glyph, fg, bg, s_antialias);
         cursor_x += glyph->advance_x;
     }
 }
+
+#include "ttf_font_status.inc"
 
 bool ttf_text_mask_px(uint8_t *mask, unsigned width, unsigned height, int x,
                       int baseline, int pixel_height, const char *text) {
@@ -3158,17 +3235,7 @@ void ttf_draw_text_px_spaced(
         uint32_t cp = decode_utf8(&cursor);
         const glyph_entry_t* glyph = get_glyph(cp, pixel_height);
         if (glyph == NULL) continue;
-        if (glyph->bitmap != NULL) {
-            for (int gy = 0; gy < glyph->height; gy++) {
-                int yy = y - glyph->top + gy;
-                for (int gx = 0; gx < glyph->width; gx++) {
-                    uint8_t alpha = glyph->bitmap[gy * glyph->width + gx];
-                    if (alpha == 0) continue;
-                    epd_draw_pixel(cursor_x + glyph->left + gx, yy,
-                                   mix_ink(alpha, fg, bg) << 4, framebuffer);
-                }
-            }
-        }
+        blit_upright(framebuffer, cursor_x, y, glyph, fg, bg, s_antialias);
         cursor_x += glyph->advance_x;
         if (*cursor) cursor_x += tracking_px;
     }
@@ -3293,21 +3360,6 @@ static const glyph_entry_t* vertical_glyph_for(uint32_t cp, int pixel_height, ui
     return glyph;
 }
 
-// 正立落字形：pen_x 是字身框左边缘，baseline 是框内基线。
-// Blit an upright glyph: pen_x is the em box's left edge and baseline its baseline inside it.
-static void blit_upright(uint8_t* framebuffer, int pen_x, int baseline,
-                         const glyph_entry_t* glyph, uint8_t fg, uint8_t bg) {
-    if (glyph->bitmap == NULL) return;
-    for (int gy = 0; gy < glyph->height; gy++) {
-        int yy = baseline - glyph->top + gy;
-        for (int gx = 0; gx < glyph->width; gx++) {
-            uint8_t alpha = glyph->bitmap[gy * glyph->width + gx];
-            if (alpha == 0) continue;
-            epd_draw_pixel(pen_x + glyph->left + gx, yy, mix_ink(alpha, fg, bg) << 4, framebuffer);
-        }
-    }
-}
-
 // 旋转落字形：先在字身框里按横排基线落位，再把整个方框顺时针转 90°：(u, v) -> (px-1-v, u)。
 // 字的顶端因此朝右，和 OpenType 竖排对拉丁文的默认旋转一致。
 // Blit a rotated glyph: lay it on the horizontal baseline inside the em box, then turn the box
@@ -3325,7 +3377,15 @@ static void blit_rotated(uint8_t* framebuffer, int x, int y, int cell, int pixel
             if (alpha == 0) continue;
             int u = glyph->left + gx;
             if (u < 0 || u >= pixel_height) continue;
-            epd_draw_pixel(x + rx, y + cell + u, mix_ink(alpha, fg, bg) << 4, framebuffer);
+            int xx = x + rx, yy = y + cell + u;
+#if KIIKO_BOARD_METALIO47 && defined(ESP_PLATFORM)
+            if (s_reader_body_aa && s_antialias && fg == 0 && bg == 15) {
+                uint8_t gray = reader_gray_at(alpha, xx, yy);
+                if (gray != 15) epd_draw_pixel(xx, yy, gray << 4, framebuffer);
+                continue;
+            }
+#endif
+            epd_draw_pixel(xx, yy, mix_ink(alpha, fg, bg) << 4, framebuffer);
         }
     }
 }
@@ -3424,7 +3484,7 @@ int ttf_draw_text_px_vertical(
                 int dx = 0, dy = 0;
                 if (vertical_corner_cp(cp)) { dx = cell_px / 2; dy = -cell_px / 2; }
                 else if (centered) dx = run_dx;
-                blit_upright(framebuffer, x + dx, y + cell + baseline + dy, glyph, fg, bg);
+                blit_upright(framebuffer, x + dx, y + cell + baseline + dy, glyph, fg, bg, s_antialias);
             }
         }
         cell += glyph->advance_x;
@@ -3504,16 +3564,7 @@ void ttf_draw_text_px_fitted(
         run_apply((size_t)(cursor - text));
         uint32_t cp = decode_utf8(&cursor);
         const glyph_entry_t* glyph = get_glyph(cp, pixel_height);
-        if (glyph && glyph->bitmap) {
-            for (int gy = 0; gy < glyph->height; ++gy) {
-                int yy = y - glyph->top + gy;
-                for (int gx = 0; gx < glyph->width; ++gx) {
-                    uint8_t alpha = glyph->bitmap[gy * glyph->width + gx];
-                    if (alpha) epd_draw_pixel(cursor_x + glyph->left + gx, yy,
-                                              mix_ink(alpha, fg, bg) << 4, framebuffer);
-                }
-            }
-        }
+        if (glyph) blit_upright(framebuffer, cursor_x, y, glyph, fg, bg, s_antialias);
         if (glyph) cursor_x += glyph->advance_x;
         if (*cursor) {
             const char* peek = cursor;

@@ -17,7 +17,10 @@ void app_home_cover_mode_changed(void) {}
 esp_err_t pico_boot_save_resume(const pico_resume_t *resume) { (void)resume; return ESP_OK; }
 void pico_boot_clear_resume(void) {}
 bool app_book_resume_context(char *p,size_t c,bool *f) { (void)p;(void)c;(void)f;return false; }
+bool test_reader_open;
 #include "read_pico_transfer.h"
+#include "book/book_weread_cover.h"
+#include "book/book_xteink_sync.h"
 #include "ble_page_turner.h"
 #include "ui_nav_layout.h"
 #include "ui_ai_menu.h"
@@ -26,6 +29,10 @@ bool app_book_resume_context(char *p,size_t c,bool *f) { (void)p;(void)c;(void)f
 #include <setjmp.h>
 #include <stdio.h>
 #include <string.h>
+
+book_weread_cover_status_t book_weread_cover_status(void){return (book_weread_cover_status_t){0};}
+bool xteink_sync_busy(void){return false;}
+void read_pico_transfer_idle_poll(bool in_use){(void)in_use;}
 
 const app_desc_t app_book = {.title="book"};
 bool app_book_volume_key(app_ctx_t *ctx,int direction,app_redraw_t *redraw){(void)ctx;(void)direction;(void)redraw;return false;}
@@ -76,6 +83,9 @@ bool display_main_switch_erase_set(bool v){(void)v;return false;}
 bool display_main_shelf_home_erase_set(bool v){(void)v;return false;}
 bool app_sleep_media_ready(void){return true;}
 bool app_sleep_media_failed(void){return false;}
+bool app_sleep_media_pending(void){return false;}
+bool app_sleep_book_reopen_failed(void){return false;}
+void app_book_wake_file_failed(app_ctx_t *ctx){(void)ctx;assert(false);}
 #include "online_font.h"
 void online_font_status(online_font_status_t *s){s->busy=false;}
 void app_sleep_discard_media_io(void){}
@@ -207,7 +217,7 @@ void ble_pt_cancel_recent(void){++recent_cancels;}
 void ui_quick_menu_draw_status(uint8_t *fb){(void)fb;++status_draws;}
 void ui_quick_menu_end(void){}
 bool ui_quick_menu_restore(uint8_t *fb){fb[0]=0x11;return true;}
-bool ui_quick_menu_draw_button(uint8_t *fb,unsigned index,bool enabled,bool pressed,EpdRect *dirty) {(void)fb;(void)pressed;assert(index<4);assert(enabled==(index==0?transfer_status.mode==READ_PICO_TRANSFER_MODE_STA&&transfer_status.state!=READ_PICO_TRANSFER_STOPPED:index==1?ble_enabled:index==3?light_enabled:false));*dirty=(EpdRect){UI_QUICK_CENTER_X(index)-48,UI_QUICK_CENTER_Y(index)-48,96,96};++button_draws;return true;}
+bool ui_quick_menu_draw_button(uint8_t *fb,unsigned index,bool enabled,bool pressed,EpdRect *dirty) {(void)fb;(void)pressed;assert(index<4);assert(enabled==(index==0?transfer_status.wifi_enabled:index==1?ble_enabled:index==3?light_enabled:false));*dirty=(EpdRect){UI_QUICK_CENTER_X(index)-48,UI_QUICK_CENTER_Y(index)-48,96,96};++button_draws;return true;}
 
 EpdRect ui_quick_button_rect(unsigned index) {return (EpdRect){UI_QUICK_CENTER_X(index)-46,UI_QUICK_CENTER_Y(index)-46,93,93};}
 EpdRect ui_quick_slider_change_rect(bool warmth,unsigned before,unsigned after) {int a=240-(int)before,b=240-(int)after,t=a<b?a:b,z=a>b?a:b;if(t<2)t=2;if(t>238)t=238;if(z<2)z=2;if(z>238)z=238;return (EpdRect){UI_QUICK_SLIDER_X(warmth)+2,104+t,112,z>t?z-t:0};}
@@ -217,10 +227,10 @@ void app_settings_set_ble_turner(bool enabled) {ble_enabled=enabled;}
 void ble_pt_reset_failure(void) {++ble_resets;}
 bool ble_pt_pop_key(ble_pt_event_t *e) {(void)e;return false;}
 bool ble_pt_pop_raw(ble_pt_raw_t *e) {(void)e;return false;}
-void read_pico_transfer_get_status(read_pico_transfer_status_t *s) {if(network_ready_step>=0&&step>=network_ready_step)transfer_status.network_ready=true;if(wifi_stop_step>=0&&step>=wifi_stop_step)transfer_status.state=READ_PICO_TRANSFER_STOPPED;*s=transfer_status;}
+void read_pico_transfer_get_status(read_pico_transfer_status_t *s) {if(network_ready_step>=0&&step>=network_ready_step)transfer_status.network_ready=true;if(wifi_stop_step>=0&&step>=wifi_stop_step){transfer_status.state=READ_PICO_TRANSFER_STOPPED;transfer_status.wifi_enabled=false;}*s=transfer_status;}
 int read_pico_transfer_get_saved_wifi(char *ssid,bool *configured) {strcpy(ssid,"saved");*configured=saved_wifi;return ESP_OK;}
-int read_pico_transfer_start(const read_pico_transfer_cfg_t *cfg) {assert(cfg->mode==READ_PICO_TRANSFER_MODE_STA&&cfg->network_only);++wifi_starts;transfer_status.mode=cfg->mode;transfer_status.state=1;return ESP_OK;}
-bool read_pico_transfer_try_stop_if_idle(void) {if(upload_busy)return false;++wifi_stops;transfer_status.state=0;return true;}
+int read_pico_transfer_start(const read_pico_transfer_cfg_t *cfg) {assert(cfg->mode==READ_PICO_TRANSFER_MODE_STA&&cfg->network_only);++wifi_starts;transfer_status.mode=cfg->mode;transfer_status.state=1;transfer_status.wifi_enabled=true;return ESP_OK;}
+bool read_pico_transfer_try_stop_if_idle(void) {if(upload_busy)return false;++wifi_stops;transfer_status.state=0;transfer_status.wifi_enabled=false;return true;}
 static int pulse_tab=-1,pulse_requests,pulse_draws;
 void ui_click_feedback_reset(void) {click_active=false;pulse_tab=-1;}
 void ui_click_feedback_begin(uint8_t *fb) {(void)fb;click_active=false;}
@@ -416,6 +426,13 @@ static app_redraw_t main_late_tick(app_ctx_t* ctx) {(void)ctx;return step == 1 ?
 static bool child_view;
 static bool child_root(app_ctx_t *ctx){(void)ctx;return !child_view;}
 static app_redraw_t child_cycle(app_ctx_t *ctx){(void)ctx;child_view=!child_view;return APP_REDRAW_PAGE;}
+void app_book_shelf_prefetch_cancel(void) {}
+void app_book_shelf_prefetch_reset(void) {}
+void app_book_shelf_prefetch_first(app_ctx_t *ctx) { (void)ctx; }
+
+bool ble_pt_take_standby(void) { return false; }
+bool cst836u_peek_touch(void *h, cst836u_touch_t *t) { return cst836u_read(h, t) == 0 && t->touched; }
+
 int main(void) {
     for(int white=0;white<2;++white)for(int binary=0;binary<2;++binary){
         reset();child_view=false;first.enter_full=true;first.persistent_navigation=true;
@@ -465,18 +482,17 @@ int main(void) {
     samples[0]=(sample_t){.x=10,.y=1141,.count=2};assert(!app_poll_main_navigation(&loading));
     samples[0]=(sample_t){.x=10,.y=1141,.count=1,.error=-1};assert(!app_poll_main_navigation(&loading));
 
-    // 冷封面加载的轮询中，点当前书架也能反馈，保持不取消；同一接触不重复。
-    // During cold-cover polling even the current shelf responds without cancelling; one contact never repeats.
+    // A scan can yield to any queued contact without consuming a book tap or drawing feedback.
     uint8_t loading_fb=0;EpdiyHighlevelState loading_hl={0};
     loading.fb=&loading_fb;loading.hl=&loading_hl;loading.request_app=NULL;
     samples[0]=(sample_t){0};assert(!app_poll_main_navigation(&loading));
     int loading_pulses=pulse_draws;
     samples[0]=(sample_t){.x=200,.y=1141,.count=1};
-    assert(!app_poll_main_navigation(&loading)&&pulse_draws==loading_pulses+1);
-    assert(!app_poll_main_navigation(&loading)&&pulse_draws==loading_pulses+1);
-    samples[0]=(sample_t){0};assert(!app_poll_main_navigation(&loading));
-    samples[0]=(sample_t){.x=200,.y=1141,.count=1};
-    assert(!app_poll_main_navigation(&loading)&&pulse_draws==loading_pulses+2);
+    assert(app_touch_input_pending(&loading));
+    assert(!app_poll_main_navigation(&loading)&&pulse_draws==loading_pulses);
+    samples[0]=(sample_t){0};assert(!app_touch_input_pending(&loading));
+    samples[0]=(sample_t){.x=100,.y=400,.count=1};
+    assert(!app_poll_main_navigation(&loading)&&app_touch_input_pending(&loading));
 
     reset();add(100,400,1,0);add(110,400,1,0);add(0,0,0,0);run();
     assert(touch_calls==1&&ticks==3&&!tick_consumed[0]);
@@ -676,7 +692,7 @@ int main(void) {
     add(100,152,1,0);add(100,152,1,0);add(0,0,0,0);
     add(100,152,1,0);add(0,0,0,0);run();
     assert(wifi_starts==1&&wifi_stops==1&&quick_opens==1&&quick_draws==1&&button_draws==4&&button_partial_draws==4&&!quick_du&&!touch_calls);
-    reset();upload_busy=true;transfer_status=(read_pico_transfer_status_t){.state=1,.mode=READ_PICO_TRANSFER_MODE_STA};
+    reset();upload_busy=true;transfer_status=(read_pico_transfer_status_t){.state=1,.mode=READ_PICO_TRANSFER_MODE_STA,.wifi_enabled=true};
     add(300,20,1,0);add(300,110,1,0);add(0,0,0,0);add(100,152,1,0);add(0,0,0,0);run();
     assert(!wifi_starts&&!wifi_stops&&transfer_status.state==1);
     assert(quick_opens==1&&button_partial_draws==2&&quick_draws==1);
@@ -698,14 +714,14 @@ int main(void) {
         add(100,284,1,0);add(0,0,0,0);add(100,500,1,0);add(0,0,0,0);run();
         assert(clean_action_fulls==1&&quick_draws==1&&touch_calls==1);
     }
-    // 网络ready只改变内部状态，不重画菜单；异步WiFi停止只刷WiFi圆钮。
-    // Network readiness is nonvisual; an asynchronous stop refreshes only its WiFi control.
-    reset();network_ready_step=4;transfer_status=(read_pico_transfer_status_t){.state=1,.mode=READ_PICO_TRANSFER_MODE_STA};
+    // 网络ready只改变内部状态，不重画菜单；异步WiFi停止只刷WiFi圆钮和状态栏。
+    // Network readiness is nonvisual; an asynchronous stop refreshes its WiFi control and status bar.
+    reset();network_ready_step=4;transfer_status=(read_pico_transfer_status_t){.state=1,.mode=READ_PICO_TRANSFER_MODE_STA,.wifi_enabled=true};
     add(300,20,1,0);add(300,110,1,0);add(0,0,0,0);add(0,0,0,0);add(0,0,0,0);add(0,0,0,0);run();
-    assert(quick_opens==1&&quick_draws==1&&!button_draws&&!button_partial_draws&&status_draws==1&&status_partial_draws==1);
-    reset();wifi_stop_step=4;transfer_status=(read_pico_transfer_status_t){.state=1,.mode=READ_PICO_TRANSFER_MODE_STA};
+    assert(quick_opens==1&&quick_draws==1&&!button_draws&&!button_partial_draws&&status_draws==0&&status_partial_draws==0);
+    reset();wifi_stop_step=4;transfer_status=(read_pico_transfer_status_t){.state=1,.mode=READ_PICO_TRANSFER_MODE_STA,.wifi_enabled=true};
     add(300,20,1,0);add(300,110,1,0);add(0,0,0,0);add(0,0,0,0);add(0,0,0,0);add(0,0,0,0);run();
-    assert(quick_opens==1&&quick_draws==1&&button_draws==1&&button_partial_draws==1);
+    assert(quick_opens==1&&quick_draws==1&&button_draws==1&&button_partial_draws==1&&status_draws==1&&status_partial_draws==1);
     reset();light_enabled=false;light_brightness=light_brightness_position=0;
     add(300,20,1,0);add(300,110,1,0);add(0,0,0,0);add(244,284,1,0);add(0,0,0,0);run();
     assert(light_enabled&&light_brightness_position==72&&button_draws==2&&slider_draws==1&&quick_opens==1&&!slider_forced_draws);
@@ -934,7 +950,7 @@ int main(void) {
         if(trial==0)online_busy=true;
         if(trial==1)download_session=true;
         if(trial==2)first.holds_pmu=true;
-        if(trial==3)transfer_status.state=READ_PICO_TRANSFER_UPLOADING;
+        if(trial==3){transfer_status.state=READ_PICO_TRANSFER_UPLOADING;transfer_status.wifi_enabled=true;}
         add(0,0,0,0);add(0,0,0,0);run();assert(!ai_open_calls&&!gl_areas&&fulls==1);
     }
     for(int held=0;held<2;++held){

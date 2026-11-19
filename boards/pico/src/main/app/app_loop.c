@@ -89,6 +89,7 @@
 #include "ui_click_feedback.h"
 #include "usb_storage.h"
 #include "local_latency_probe.h"
+#include "app_network_idle.inc"
 
 #define TAG "app_loop"
 
@@ -129,8 +130,8 @@ static void main_lock_boundary(void) {
 static unsigned quick_status(void) {
     read_pico_transfer_status_t status;
     read_pico_transfer_get_status(&status);
-    bool wifi = status.mode == READ_PICO_TRANSFER_MODE_STA && status.state != READ_PICO_TRANSFER_STOPPED;
-    return (wifi ? 1u : 0u) | (app_settings_ble_turner() ? 2u : 0u) | (status.network_ready ? 4u : 0u);
+    bool wifi = status.wifi_enabled;
+    return (wifi ? 1u : 0u) | (app_settings_ble_turner() ? 2u : 0u);
 }
 
 // 同步输出完再接收下一条触摸，不安排旧层回放；错误时关闭层并可靠全刷当前页。
@@ -211,8 +212,7 @@ static void quick_buttons_present(app_ctx_t *ctx,const app_desc_t *current) {
             if(error!=EPD_DRAW_SUCCESS)break;
         }
     }
-    bool network_changed=(status&5u)==5u,was_network=(s_quick_status&5u)==5u;
-    if(error==EPD_DRAW_SUCCESS&&(((status^s_quick_status)&2u)||network_changed!=was_network)){
+    if(error==EPD_DRAW_SUCCESS&&((status^s_quick_status)&3u)){
         ui_quick_menu_draw_status(ctx->fb);
         error=update_display_area_diff_with(ctx->hl,&E0470_WAVEFORM,MODE_GL16,(EpdRect){0,0,UI_LOCK_WIDTH,76});
         guard_draw_result(ctx->hl,error);
@@ -226,7 +226,7 @@ static void quick_buttons_present(app_ctx_t *ctx,const app_desc_t *current) {
 static void quick_toggle_wifi(void) {
     read_pico_transfer_status_t status;
     read_pico_transfer_get_status(&status);
-    if (status.state != READ_PICO_TRANSFER_STOPPED) {
+    if (status.wifi_enabled) {
         // 上传期间拒绝断开，复用存储任务已有的原子准入保护。
         // Refuse disconnecting during upload using the storage owner's atomic admission guard.
         (void)read_pico_transfer_try_stop_if_idle();
@@ -380,7 +380,10 @@ void app_present(app_ctx_t* ctx,const app_desc_t* app,app_redraw_t redraw) {
     const bool white_switch=root_switch||child_white;
     const bool shelf_switch=root_switch &&
         (app_index_of(s_presented_root)==1 || app_index_of(app)==1);
-    unsigned previous=display_main_quality_set(white_switch?(shelf_switch?8u:6u):0u);
+    unsigned white_phases = 0;
+    if (white_switch)
+        white_phases = app_settings_main_fast_refresh() ? PICO_MAIN_FAST_WHITE_PHASES : shelf_switch ? 8u : 6u;
+    unsigned previous = display_main_quality_set(white_phases);
     app_present_impl(ctx,app,redraw);
     display_main_quality_set(previous);
 }
@@ -493,12 +496,14 @@ static void switch_to(
     app_ctx_t* ctx, const app_desc_t** current, const app_desc_t* next
 ) {
     if (!next || (next==*current && (!next->persistent_navigation || main_page_ready(ctx,next)))) return;
+    const bool reader_to_home = *current==&app_book && next==app_at(0) && app_book_reading_active();
 #if defined(KIIKO_LOCAL_LATENCY) || KIIKO_BOARD_METALIO47
     const int64_t probe_start=esp_timer_get_time();
     const int probe_from=app_index_of(*current);
 #endif
     bool main_source = navigation_page_ready(ctx, *current);
     bool shelf_source = main_source && app_index_of(*current) == 1;
+    app_book_shelf_prefetch_cancel();
     display_main_transition_cancel();
     if ((*current)->on_exit != NULL) (*current)->on_exit(ctx);
 #if defined(KIIKO_LOCAL_LATENCY) || KIIKO_BOARD_METALIO47
@@ -514,7 +519,7 @@ static void switch_to(
     const int64_t probe_enter=esp_timer_get_time();
 #endif
     if (main_source && navigation_page_ready(ctx, next)) display_main_transition_arm(next, shelf_source, true);
-    app_present(ctx, next, next->enter_full ? APP_REDRAW_FULL : APP_REDRAW_PAGE);
+    app_present(ctx, next, (reader_to_home || next->enter_full) ? APP_REDRAW_FULL : APP_REDRAW_PAGE);
     display_main_transition_disarm();
 #ifdef KIIKO_LOCAL_LATENCY
     if(local_probe_contact_start_us){
@@ -619,7 +624,10 @@ static bool poll_media(app_ctx_t* ctx, const app_desc_t* current,
     *mounted = ready;
     if (ready) *invalidated = false;
     if (ready) { s_media_recovery_attempts = 0; s_media_recovery_after_ms = 0; }
-    if (gained || lost) { ui_avatar_invalidate(); (void)book_cover_jobs_quiesce(0); book_lock_collage_invalidate(); }
+    if (gained || lost) {
+        app_book_shelf_prefetch_reset();
+        ui_avatar_invalidate(); (void)book_cover_jobs_quiesce(0); book_lock_collage_invalidate();
+    }
     if (gained && current->on_media_ready) current->on_media_ready(ctx);
     if (!lost) {
         if (!ready) recover_media(ctx,&info);
@@ -637,6 +645,7 @@ static bool poll_media(app_ctx_t* ctx, const app_desc_t* current,
 // 锁屏前先由页面保存进度，再持久化一次恢复上下文；不在翻页或点击时写入。
 // Flush page progress before persisting one lock checkpoint; never write it on page turns or taps.
 static void prepare_lock(app_ctx_t *ctx, const app_desc_t *current, bool feedback) {
+    app_book_shelf_prefetch_cancel();
     if (feedback) app_lock_feedback(ctx->hl);
     if (current->on_before_lock) current->on_before_lock(ctx);
     int tab = app_index_of(current);
@@ -660,6 +669,13 @@ static void run_power_action(app_ctx_t *ctx, const app_desc_t *current, bool res
     if (error != ESP_OK) ESP_LOGW(TAG, "power off failed: %s", esp_err_to_name(error));
     // 关机交接失败时回到可操作原页；不关闭书籍后再重新自动开书。/ A failed shutdown returns to the operable current page without closing/reopening the book.
     app_present(ctx, current, APP_REDRAW_PAGE);
+}
+
+bool app_touch_input_pending(app_ctx_t *ctx) {
+    if (ctx->request_app || ctx->request_return || ctx->request_menu ||
+        (ctx->touch && ctx->touch->touched)) return true;
+    cst836u_touch_t touch = {0};
+    return ctx->tp && cst836u_read(ctx->tp, &touch) == ESP_OK && touch.touched;
 }
 
 bool app_poll_main_navigation(app_ctx_t *ctx) {
@@ -782,6 +798,7 @@ void app_loop_run(const app_loop_config_t* config) {
         if (ctx.now_ms - last_network_poll_ms >= 500) {
             last_network_poll_ms = ctx.now_ms;
             read_pico_transfer_service_poll();
+            poll_wifi_idle();
             app_time_service_poll(!touch.touched &&
                 (ctx.now_ms-last_input_ms>=10000||(current->setup_flow&&app_time_service_online_sync_pending())) &&
                 !current->holds_pmu && !usb_storage_active() && !pico_online_busy() && !ble_pt_connected());
@@ -1226,7 +1243,7 @@ void app_loop_run(const app_loop_config_t* config) {
         // WiFi runs on C6 and BLE on S3; both consume S3 internal memory, so network leases pause BLE and release it afterwards.
         read_pico_transfer_status_t transfer;
         read_pico_transfer_get_status(&transfer);
-        const bool wifi_busy = transfer.state != READ_PICO_TRANSFER_STOPPED ||
+        const bool wifi_busy = transfer.wifi_enabled ||
             pico_online_busy();
         ble_pt_sync(app_settings_ble_turner() && !wifi_busy);
         ble_pt_poll();
@@ -1239,7 +1256,10 @@ void app_loop_run(const app_loop_config_t* config) {
             while (ble_pt_pop_raw(&raw_event)) {}
         }
         if (s_quick.open && quick_status() != s_quick_status) quick_buttons_present(&ctx,current);
-        if (!power_dialog_open && !s_quick.open && !quick_input_owned && !ui_click_feedback_active() && !menu_open && !ctx.request_app && !ctx.request_menu && !ctx.request_return && current->on_tick != NULL) {
+        const bool page_exposed = !power_dialog_open && !s_quick.open && !quick_input_owned &&
+            !menu_open && !ctx.request_app && !ctx.request_menu && !ctx.request_return;
+        if (current == &app_book) app_book_ticket_sample(ctx.now_ms, page_exposed);
+        if (page_exposed && !ui_click_feedback_active() && current->on_tick != NULL) {
             app_redraw_t redraw = current->on_tick(&ctx);
             if (redraw == APP_REDRAW_PAGE || redraw == APP_REDRAW_FULL) held_key = -1;
             present_page(&ctx, current, &gesture, redraw);
@@ -1306,6 +1326,14 @@ void app_loop_run(const app_loop_config_t* config) {
             if(probe!=APP_REDRAW_NONE)app_present(&ctx,current,probe);
         }
 #endif
+        if (!idle_blocked && !menu_open && !s_quick.open && !quick_input_owned &&
+            !ui_click_feedback_active() && !ui_click_feedback_nav_pending() && !ctx.consumed &&
+            current != &app_book && main_page_ready(&ctx, current) &&
+            ctx.now_ms - last_input_ms >= 300 && ctx.now_ms >= s_lock_ignore_until_ms) {
+            app_book_shelf_prefetch_first(&ctx);
+        } else {
+            app_book_shelf_prefetch_cancel();
+        }
         // 返回来源优先；普通请求仍按切页优先处理。
         // Return requests win; ordinary requests still prioritize page switches.
         // USB MSC 持有 TF 卡时禁止任何页面切换；必须先安全停止并重新挂载。
