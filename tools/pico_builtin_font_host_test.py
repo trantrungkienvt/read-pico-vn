@@ -16,6 +16,7 @@ read=lambda path:{int(line.split('#',1)[0].strip(),16) for line in path.read_tex
 common=read(ROOT/'tools/fixtures/reader-common-6500.txt');assert len(common)==6500 and common<=covered
 for filename in ['reader_extra_hanzi.txt','reader_extra_outlines.txt']:assert read(ROOT/'main/font'/filename)<=covered
 assert all(ord(ch) in covered for ch in '《》‘’『』【】①②⑩ⅠⅡⅢāáǎàéöü喆玥珺璟彧祎禛堃芃赟𠳐𥻗𬉼')
+assert all(ord(ch) in covered for ch in 'ÀÁÂÃÈÉÊÌÍÒÓÔÕÙÚÝàáâãèéêìíòóôõùúýĂăĐđĨĩŨũƠơƯưẠạẾếỒồỞởỰựỶỷ₫«»–—')
 with tempfile.TemporaryDirectory(prefix='pico-font-core-') as d:
  d=Path(d);c=d/'core.c';c.write_text('''#include <stdint.h>
 #include <math.h>
