@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <string.h>
 #include <strings.h>
 
@@ -34,6 +35,58 @@ static inline const char *chapter_label_space(const char *p) {
     return p;
 }
 
+static inline uint32_t chapter_label_utf8(const char **p) {
+    const unsigned char *s = (const unsigned char *)*p;
+    if (!s[0]) return 0;
+    if (s[0] < 0x80u) { ++*p; return s[0]; }
+    if ((s[0] & 0xe0u) == 0xc0u && (s[1] & 0xc0u) == 0x80u) {
+        *p += 2;
+        return ((uint32_t)(s[0] & 0x1fu) << 6) | (s[1] & 0x3fu);
+    }
+    if ((s[0] & 0xf0u) == 0xe0u && (s[1] & 0xc0u) == 0x80u && (s[2] & 0xc0u) == 0x80u) {
+        *p += 3;
+        return ((uint32_t)(s[0] & 0x0fu) << 12) | ((uint32_t)(s[1] & 0x3fu) << 6) | (s[2] & 0x3fu);
+    }
+    if ((s[0] & 0xf8u) == 0xf0u && (s[1] & 0xc0u) == 0x80u && (s[2] & 0xc0u) == 0x80u && (s[3] & 0xc0u) == 0x80u) {
+        *p += 4;
+        return ((uint32_t)(s[0] & 0x07u) << 18) | ((uint32_t)(s[1] & 0x3fu) << 12) |
+               ((uint32_t)(s[2] & 0x3fu) << 6) | (s[3] & 0x3fu);
+    }
+    ++*p;
+    return s[0];
+}
+
+static inline uint32_t chapter_label_vi_fold(uint32_t cp) {
+    if (cp >= 'A' && cp <= 'Z') return cp + ('a' - 'A');
+    if ((cp >= 0x00c0u && cp <= 0x00d6u) || (cp >= 0x00d8u && cp <= 0x00deu)) return cp + 0x20u;
+    if (cp == 0x0102u || cp == 0x0110u || cp == 0x0128u || cp == 0x0168u ||
+        cp == 0x01a0u || cp == 0x01afu) return cp + 1u;
+    if (cp >= 0x1ea0u && cp <= 0x1ef8u && (cp & 1u) == 0) return cp + 1u;
+    return cp;
+}
+
+static inline size_t chapter_label_encode_utf8(uint32_t cp, char out[4]) {
+    if (cp < 0x80u) { out[0] = (char)cp; return 1; }
+    if (cp < 0x800u) { out[0] = (char)(0xc0u | (cp >> 6)); out[1] = (char)(0x80u | (cp & 63u)); return 2; }
+    if (cp < 0x10000u) {
+        out[0] = (char)(0xe0u | (cp >> 12)); out[1] = (char)(0x80u | ((cp >> 6) & 63u));
+        out[2] = (char)(0x80u | (cp & 63u)); return 3;
+    }
+    out[0] = (char)(0xf0u | (cp >> 18)); out[1] = (char)(0x80u | ((cp >> 12) & 63u));
+    out[2] = (char)(0x80u | ((cp >> 6) & 63u)); out[3] = (char)(0x80u | (cp & 63u)); return 4;
+}
+
+static inline const char *chapter_label_vi_prefix(const char *text, const char *lower_prefix) {
+    const char *a = text, *b = lower_prefix;
+    while (*b) {
+        if (!*a) return NULL;
+        uint32_t ca = chapter_label_vi_fold(chapter_label_utf8(&a));
+        uint32_t cb = chapter_label_utf8(&b);
+        if (ca != cb) return NULL;
+    }
+    return a;
+}
+
 // 只排除完整的书前信息名称，不误伤“序章”或包含“目录”的正文章名。
 // Exclude complete front-matter labels, not prologues or body titles containing those words.
 static inline bool chapter_label_auxiliary(const char *text) {
@@ -44,15 +97,21 @@ static inline bool chapter_label_auxiliary(const char *text) {
         "献辞", "献词", "题献", "编者按", "编者的话", "写在前面", "出版说明", "编辑说明",
         "阅读指南", "凡例", "contents", "tableofcontents", "preface", "foreword", "introduction",
         "dedication", "acknowledgments", "acknowledgements",
+        "mụclục", "mucluc", "lờimởđầu", "lờinóiđầu", "lờitựa", "lờigiớithiệu", "giớithiệu",
+        "lờicảmơn", "cảmơn", "lờiđềtặng", "đềtặng", "bảnquyền", "thôngtinbảnquyền",
+        "thôngtinxuấtbản", "tómtắt", "vềtácgiả",
     };
     char compact[96];
     size_t used = 0;
     for (const char *p = text; *p;) {
         const char *next = chapter_label_space(p);
         if (next != p) { p = next; continue; }
-        if (used + 1 == sizeof(compact)) return false;
-        unsigned char c = (unsigned char)*p++;
-        compact[used++] = c >= 'A' && c <= 'Z' ? c + 'a' - 'A' : c;
+        uint32_t cp = chapter_label_vi_fold(chapter_label_utf8(&p));
+        char buf[4];
+        size_t n = chapter_label_encode_utf8(cp, buf);
+        if (used + n >= sizeof(compact)) return false;
+        memcpy(compact + used, buf, n);
+        used += n;
     }
     compact[used] = 0;
     for (size_t i = 0; i < sizeof(labels) / sizeof(*labels); ++i) {
@@ -63,10 +122,10 @@ static inline bool chapter_label_auxiliary(const char *text) {
     return false;
 }
 
-// Consume one heading separator, including full-width punctuation.
-// 读取一个题头分隔符，兼容全角标点。
+// Consume one heading separator, including full-width punctuation and en-dash.
+// 读取一个题头分隔符，兼容全角标点与短破折号。
 static inline size_t chapter_label_separator(const char *p) {
-    static const char *const wide[] = {"、", "。", "：", "．", "）", "－", "—", "·"};
+    static const char *const wide[] = {"、", "。", "：", "．", "）", "－", "—", "–", "·"};
     if (*p && strchr(".:)-_", *p)) return 1;
     for (size_t i = 0; i < sizeof(wide) / sizeof(*wide); ++i)
         if (!strncmp(p, wide[i], strlen(wide[i]))) return strlen(wide[i]);
@@ -171,6 +230,27 @@ static inline chapter_label_t chapter_label_parse(const char *text, bool heading
         label.kind = CHAPTER_LABEL_VOLUME;
         p = chapter_label_space(p + 4);
         english = true;
+    } else {
+        static const struct { const char *word; chapter_label_kind_t kind; } vi_prefixes[] = {
+            {"chương", CHAPTER_LABEL_CHAPTER}, {"chuong", CHAPTER_LABEL_CHAPTER},
+            {"hồi", CHAPTER_LABEL_EPISODE},    {"hoi", CHAPTER_LABEL_EPISODE},
+            {"quyển", CHAPTER_LABEL_VOLUME},   {"quyen", CHAPTER_LABEL_VOLUME},
+            {"tập", CHAPTER_LABEL_VOLUME},     {"tap", CHAPTER_LABEL_VOLUME},
+            {"phần", CHAPTER_LABEL_VOLUME},    {"phan", CHAPTER_LABEL_VOLUME},
+            {"bài", CHAPTER_LABEL_SECTION},    {"mục", CHAPTER_LABEL_SECTION},
+            {"tiết", CHAPTER_LABEL_SECTION},
+        };
+        for (size_t i = 0; i < sizeof(vi_prefixes) / sizeof(*vi_prefixes); ++i) {
+            const char *after_word = chapter_label_vi_prefix(p, vi_prefixes[i].word);
+            if (!after_word || chapter_label_space(after_word) == after_word) continue;
+            label.kind = vi_prefixes[i].kind;
+            p = chapter_label_space(after_word);
+            const char *ord = chapter_label_vi_prefix(p, "thứ");
+            if (!ord) ord = chapter_label_vi_prefix(p, "thu");
+            if (ord && chapter_label_space(ord) != ord) p = chapter_label_space(ord);
+            english = true;
+            break;
+        }
     }
     const char *digits = p;
     if (!chapter_label_number(&p, &label.number) &&
@@ -214,9 +294,8 @@ static inline bool chapter_label_text_equal(const char *a, const char *b) {
             a = next_a; b = next_b;
             continue;
         }
-        unsigned char x = (unsigned char)*a++, y = (unsigned char)*b++;
-        if (x >= 'A' && x <= 'Z') x += 'a' - 'A';
-        if (y >= 'A' && y <= 'Z') y += 'a' - 'A';
+        uint32_t x = chapter_label_vi_fold(chapter_label_utf8(&a));
+        uint32_t y = chapter_label_vi_fold(chapter_label_utf8(&b));
         if (x != y) return false;
     }
     return !*chapter_label_space(a) && !*chapter_label_space(b);

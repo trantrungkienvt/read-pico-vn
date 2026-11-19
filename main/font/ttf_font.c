@@ -20,6 +20,7 @@
 
 #include "ttf_font.h"
 #include "text_glue.h"
+#include "vi_nfc.h"
 #include "../kiiko_board_config.h"
 #include "ttf_stroke_filter.h"
 #include "ui_hanzi_aa_scale.h"
@@ -1832,30 +1833,30 @@ static uint8_t* build_working_font(const uint8_t* header, size_t header_len) {
 static uint32_t decode_utf8(const char** cursor) {
     const uint8_t* p = (const uint8_t*)*cursor;
     if (p[0] == 0) return 0;
+    uint32_t cp;
     if (p[0] < 0x80) {
         *cursor += 1;
-        return p[0];
-    }
-    if ((p[0] & 0xE0) == 0xC0 && (p[1] & 0xC0) == 0x80) {
+        cp = p[0];
+    } else if ((p[0] & 0xE0) == 0xC0 && (p[1] & 0xC0) == 0x80) {
         *cursor += 2;
-        return ((uint32_t)(p[0] & 0x1F) << 6) | (p[1] & 0x3F);
-    }
-    if ((p[0] & 0xF0) == 0xE0 && (p[1] & 0xC0) == 0x80 && (p[2] & 0xC0) == 0x80) {
+        cp = ((uint32_t)(p[0] & 0x1F) << 6) | (p[1] & 0x3F);
+    } else if ((p[0] & 0xF0) == 0xE0 && (p[1] & 0xC0) == 0x80 && (p[2] & 0xC0) == 0x80) {
         *cursor += 3;
-        return ((uint32_t)(p[0] & 0x0F) << 12)
+        cp = ((uint32_t)(p[0] & 0x0F) << 12)
             | ((uint32_t)(p[1] & 0x3F) << 6)
             | (p[2] & 0x3F);
-    }
-    if ((p[0] & 0xF8) == 0xF0 && (p[1] & 0xC0) == 0x80
+    } else if ((p[0] & 0xF8) == 0xF0 && (p[1] & 0xC0) == 0x80
         && (p[2] & 0xC0) == 0x80 && (p[3] & 0xC0) == 0x80) {
         *cursor += 4;
-        return ((uint32_t)(p[0] & 0x07) << 18)
+        cp = ((uint32_t)(p[0] & 0x07) << 18)
             | ((uint32_t)(p[1] & 0x3F) << 12)
             | ((uint32_t)(p[2] & 0x3F) << 6)
             | (p[3] & 0x3F);
+    } else {
+        *cursor += 1;
+        return 0xFFFD;
     }
-    *cursor += 1;
-    return 0xFFFD;
+    return vi_nfc_consume_marks(cp, cursor);
 }
 
 static int clamp_size(int size) {

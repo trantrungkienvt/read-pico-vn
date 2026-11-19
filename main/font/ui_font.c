@@ -12,6 +12,7 @@
 #include "ui_font.h"
 #include "ui_hanzi.h"
 #include "ui_hanzi_scale.h"
+#include "vi_nfc.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -68,8 +69,13 @@ static bool ready(void) {
 
 static uint32_t next_cp(const char **p) {
     const unsigned char *s = (const unsigned char *)*p;
-    uint32_t cp = *s++;
-    if (cp < 0x80) { *p = (const char *)s; return cp; }
+    uint32_t cp = *s;
+    if (!cp) return 0;
+    ++s;
+    if (cp < 0x80) {
+        *p = (const char *)s;
+        return vi_nfc_consume_marks(cp, p);
+    }
     int count = cp >= 0xc2 && cp <= 0xdf ? 1 : cp >= 0xe0 && cp <= 0xef ? 2 : cp >= 0xf0 && cp <= 0xf4 ? 3 : 0;
     if (!count) { *p = (const char *)s; return '?'; }
     cp &= (1u << (6 - count)) - 1;
@@ -78,7 +84,7 @@ static uint32_t next_cp(const char **p) {
         cp = (cp << 6) | (s[i] & 0x3f);
     }
     *p = (const char *)(s + count);
-    return cp;
+    return vi_nfc_consume_marks(cp, p);
 }
 
 bool ui_font_has_text(const char *text) {

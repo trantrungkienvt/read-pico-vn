@@ -37,6 +37,7 @@ def main():
     ap.add_argument("--src", type=Path, required=True)
     ap.add_argument("--font", type=Path, default=ROOT / "boards/pico/src/main/assets/builtin.ttf")
     ap.add_argument("--out", type=Path)
+    ap.add_argument("--both", action="store_true", help="Also copy the resulting builtin.ttf to boards/metalio47/src/main/assets/builtin.ttf")
     a = ap.parse_args()
     out = a.out or a.font
 
@@ -77,6 +78,11 @@ def main():
     out.parent.mkdir(parents=True, exist_ok=True)
     f.save(out)
     data = out.read_bytes()
+    if a.both:
+        s31_out = ROOT / "boards/metalio47/src/main/assets/builtin.ttf"
+        if s31_out.resolve() != out.resolve():
+            s31_out.parent.mkdir(parents=True, exist_ok=True)
+            s31_out.write_bytes(data)
     print(json.dumps(dict(added=len(todo), glyphs=len(order), bytes=len(data),
                           sha256=hashlib.sha256(data).hexdigest())))
 

@@ -225,7 +225,7 @@ static bool title_boundary(const char *s) {
     if (!*s || skip_space(s) != s) return true;
     uint32_t cp; utf8_one((const unsigned char *)s, strlen(s), &cp);
     return (cp < 128 && strchr(":.-_)]!?", (int)cp)) || cp==0xff1a || cp==0x3001 ||
-        cp==0x3002 || cp==0xff09 || cp==0x3011 || cp==0x00b7;
+        cp==0x3002 || cp==0xff09 || cp==0x3011 || cp==0x00b7 || cp==0x2013 || cp==0x2014;
 }
 static bool roman_heading_number(const char *s, size_t n) {
     if (!n || n>15) return false;
@@ -276,11 +276,31 @@ static bool strong_heading(const char *line, bool isolated) {
         if(!strncasecmp(s,english[i],n) && (skip_space(s+n)!=s+n || isdigit((unsigned char)s[n])))
             return english_heading_number(skip_space(s+n));
     }
+    static const char *const vi_numbered[]={"chương","chuong","hồi","hoi","quyển","quyen","tập","tap","phần","phan"};
+    for(size_t i=0;i<sizeof(vi_numbered)/sizeof(*vi_numbered);++i) {
+        const char *after=chapter_label_vi_prefix(s,vi_numbered[i]);
+        if(after && (skip_space(after)!=after || isdigit((unsigned char)*after))) {
+            const char *num=skip_space(after);
+            const char *ord=chapter_label_vi_prefix(num,"thứ");
+            if(!ord)ord=chapter_label_vi_prefix(num,"thu");
+            if(ord && skip_space(ord)!=ord)num=skip_space(ord);
+            return english_heading_number(num);
+        }
+    }
     static const char *special[]={"简介","内容简介","序","序言","序章","前言","楔子","引子","尾声","后记","终章","跋","附录","Prologue","Epilogue","Appendix"};
     if (!strncmp(s,"番外",6)) return true;
     for(size_t i=0;i<sizeof(special)/sizeof(*special);++i) {
         size_t n=strlen(special[i]);
         if(!strncasecmp(s,special[i],n) && title_boundary(s+n))return true;
+    }
+    static const char *const vi_special[]={
+        "lời mở đầu","lời nói đầu","lời tựa","lời giới thiệu","mở đầu","dẫn nhập",
+        "khúc dạo đầu","vĩ thanh","lời kết","lời bạt","kết thúc","phụ lục",
+        "ngoại truyện","phiên ngoại","tóm tắt","giới thiệu"
+    };
+    for(size_t i=0;i<sizeof(vi_special)/sizeof(*vi_special);++i) {
+        const char *after=chapter_label_vi_prefix(s,vi_special[i]);
+        if(after && title_boundary(after))return true;
     }
     bool ordinal=!strncmp(s,"第",3);
     if (ordinal) s=skip_space(s+3);
@@ -357,6 +377,35 @@ static unsigned navigation_numbering(const char *line) {
         }
         if(!number||!title_boundary(s))return 0;
         volume=i==1;english_number=true;goto classified;
+    }
+    static const struct { const char *word; bool volume; bool soft_part; } vi_heads[]={
+        {"chương",false,true},{"chuong",false,true},{"hồi",false,true},{"hoi",false,true},
+        {"phần",true,true},{"phan",true,true},
+        {"quyển",true,false},{"quyen",true,false},{"tập",true,false},{"tap",true,false},
+    };
+    for(size_t i=0;i<sizeof(vi_heads)/sizeof(*vi_heads);++i) {
+        const char *after=chapter_label_vi_prefix(s,vi_heads[i].word);
+        if(!after || (skip_space(after)==after && !isdigit((unsigned char)*after)))continue;
+        s=skip_space(after);
+        const char *ord=chapter_label_vi_prefix(s,"thứ");
+        if(!ord)ord=chapter_label_vi_prefix(s,"thu");
+        if(ord && skip_space(ord)!=ord)s=skip_space(ord);
+        const char *begin=s;
+        if(isdigit((unsigned char)*s))number=heading_ordinal(&s);
+        else {
+            while(*s&&strchr("IVXLCDMivxlcdm",*s)&&s-begin<16)++s;
+            if(!roman_heading_number(begin,(size_t)(s-begin)))return 0;
+            unsigned previous=0;
+            static const char roman_digits[]="IVXLCDM";
+            for(const char *p=s;p>begin;){
+                const char *at=strchr(roman_digits,toupper((unsigned char)*--p));
+                static const unsigned values[]={1,5,10,50,100,500,1000};
+                unsigned v=values[at-roman_digits];
+                if(v<previous)number-=v;else{number+=v;previous=v;}
+            }
+        }
+        if(!number||!title_boundary(s))return 0;
+        volume=vi_heads[i].volume;english_number=vi_heads[i].soft_part;goto classified;
     }
     if(!strncmp(s,"第",3)) {
         s=skip_space(s+3);number=heading_ordinal(&s);
@@ -464,8 +513,11 @@ static void nav_observe(book_txt_t *b,nav_scan_t *scan,uint32_t offset,char *lin
     // 书名和作者行可以位于目录前；已进入正式编号章节后不重新猜测目录。
     // A book title/byline may precede contents; do not reclassify it after explicit body chapters begin.
     if (!scan->explicit_heading) {
+        const char *vi_toc = chapter_label_vi_prefix(s, "mục lục");
+        if (!vi_toc) vi_toc = chapter_label_vi_prefix(s, "muc luc");
         if(!strcmp(s,"目录")||!strcmp(s,"目次")||!strcmp(s,"总目录")||
-           !strcasecmp(s,"contents")||!strcasecmp(s,"table of contents")) {
+           !strcasecmp(s,"contents")||!strcasecmp(s,"table of contents")||
+           (vi_toc && !*skip_space(vi_toc))) {
             scan->front=true;scan->front_offset=offset;scan->blank=true;return;
         }
     }
@@ -599,6 +651,12 @@ static bool heading(const char *s) {
     if (!strncmp(s, "Chapter", 7)) {
         s += 7; while (*s == ' ' || *s == '\t') ++s;
         return isdigit((unsigned char)*s) != 0;
+    }
+    const char *vi = chapter_label_vi_prefix(s, "chương");
+    if (!vi) vi = chapter_label_vi_prefix(s, "hồi");
+    if (vi && (*vi == ' ' || *vi == '\t')) {
+        while (*vi == ' ' || *vi == '\t') ++vi;
+        return isdigit((unsigned char)*vi) != 0;
     }
     if (strncmp(s, "第", 3)) return false;
     s += 3; bool number = false;

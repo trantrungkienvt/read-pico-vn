@@ -1153,8 +1153,14 @@ static bool front_matter_title(const char *title) {
     if (!strcmp(title, "作者") || !strcmp(title, "出版") || !strcmp(title, "出版者")) return true;
     for (int i = 0; chinese[i]; ++i)
         if (!strncmp(title, chinese[i], strlen(chinese[i]))) return true;
+    static const char *const vietnamese[] = {
+        "bìa sách", "trang bìa", "bản quyền", "nhà xuất bản",
+        "thông tin sách", "thông tin xuất bản", "về tác giả", NULL
+    };
     for (int i = 0; english[i]; ++i)
         if (!strncasecmp(title, english[i], strlen(english[i]))) return true;
+    for (int i = 0; vietnamese[i]; ++i)
+        if (chapter_label_vi_prefix(title, vietnamese[i])) return true;
     return false;
 }
 

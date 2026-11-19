@@ -49,6 +49,8 @@ static bool s_images_visible = true;
 // Vertical setting: the same wrapping and kinsoku logic, with the advance running down and the
 // stack running leftward.
 static bool s_vertical;
+static bool s_vietnamese_text;
+static bool s_line_hung;
 // 竖排首页右起为竖排题头预留的列宽，调用方按同一宽度绘制题头。
 // Columns reserved from the right of the first vertical page for a vertical chapter heading; the
 // caller draws the heading into the same width.
@@ -304,8 +306,9 @@ static size_t skip_reader_spacing(size_t off) {
 static bool prohibited_line_start(uint32_t cp) {
     switch (cp) {
         case 0x0021: case 0x0025: case 0x0029: case 0x002c: case 0x002e: case 0x003a:
-        case 0x003b: case 0x003f: case 0x005d: case 0x007d:
-        case 0x2019: case 0x201d: case 0x2026: case 0x3001: case 0x3002: case 0x3009:
+        case 0x003b: case 0x003f: case 0x005d: case 0x007d: case 0x00bb:
+        case 0x2019: case 0x201d: case 0x2026: case 0x203a: case 0x20ab:
+        case 0x3001: case 0x3002: case 0x3009:
         case 0x300b: case 0x300d: case 0x300f: case 0x3011: case 0x3015: case 0x3017:
         case 0x3019: case 0x301b: case 0xff01: case 0xff05: case 0xff09: case 0xff0c:
         case 0xff0e: case 0xff1a: case 0xff1b: case 0xff1f: case 0xff3d: case 0xff5d:
@@ -316,12 +319,23 @@ static bool prohibited_line_start(uint32_t cp) {
 
 static bool prohibited_line_end(uint32_t cp) {
     switch (cp) {
-        case 0x0028: case 0x005b: case 0x007b: case 0x2018: case 0x201c: case 0x3008:
+        case 0x0028: case 0x005b: case 0x007b: case 0x00ab: case 0x2018: case 0x201c:
+        case 0x2039: case 0x3008:
         case 0x300a: case 0x300c: case 0x300e: case 0x3010: case 0x3014: case 0x3016:
         case 0x3018: case 0x301a: case 0xff08: case 0xff3b: case 0xff5b:
             return true;
         default: return false;
     }
+}
+
+// 越南语特有字母或组合音标，用于在横排中禁用英语连字符断词。
+// Vietnamese-distinctive letters or combining marks, used to keep whole syllables horizontally.
+static bool vietnamese_distinctive_cp(uint32_t cp) {
+    return cp == 0x0102u || cp == 0x0103u || cp == 0x0110u || cp == 0x0111u ||
+           cp == 0x0128u || cp == 0x0129u || cp == 0x0168u || cp == 0x0169u ||
+           cp == 0x01A0u || cp == 0x01A1u || cp == 0x01AFu || cp == 0x01B0u ||
+           (cp >= 0x1EA0u && cp <= 0x1EF9u) ||
+           cp == 0x0309u || cp == 0x031Bu || cp == 0x0323u;
 }
 
 uint32_t book_layout_generation(void) { return s_generation; }
@@ -346,6 +360,8 @@ void book_layout_free(void) {
     s_px = 0;
     s_blocks = NULL;
     s_block_count = 0;
+    s_vietnamese_text = false;
+    s_line_hung = false;
     s_image_rect = (EpdRect){0, 0, 0, 0};
 }
 
@@ -953,12 +969,26 @@ static bool take_line(size_t off, int advance_limit, int hang_margin, size_t* ne
     int64_t stretch = 0, shrink = 0, ink_stretch = 0, ink_shrink = 0;
     int64_t wrap_stretch = 0, wrap_shrink = 0;
     s_line[0] = 0;
+    s_line_hung = false;
     *paragraph_end = false;
     while (end < limit && s_text[end] != '\r' && s_text[end] != '\n') {
         size_t n = codepoint_size(s_text + end, s_len - end);
         if (!n) return false;
         uint32_t cp = codepoint_value(s_text + end, n);
-        bool word = !s_vertical && latin_member(cp, last_cp, end, n, limit);
+        // 组合音标（如 NFD 越南语声调）与基字符合并测量，避免跨行拆分或字宽偏差。
+        // Keep trailing Unicode combining marks with their base letter so NFD Vietnamese
+        // clusters measure identically to composed glyphs and never break mid-cluster.
+        size_t cluster = n;
+        if (cp != 0xFFFCu && !(cp >= 0x0300u && cp <= 0x036Fu)) {
+            while (end + cluster < limit) {
+                size_t mn = codepoint_size(s_text + end + cluster, limit - (end + cluster));
+                if (!mn || cluster + mn >= 16) break;
+                uint32_t mcp = codepoint_value(s_text + end + cluster, mn);
+                if (mcp < 0x0300u || mcp > 0x036Fu) break;
+                cluster += mn;
+            }
+        }
+        bool word = !s_vertical && latin_member(cp, last_cp, end, cluster, limit);
         if (word && !previous_word) {
             word_start = end;
             // 开括号跟随首词；普通连字符自身保留在上一行。
@@ -972,9 +1002,9 @@ static bool take_line(size_t off, int advance_limit, int hang_margin, size_t* ne
         if (cp >= 0x2e80 && cp <= 0xffef) english_line = false;
         // 字体逐字取整后累加 advance；单字测量避免反复扫描整行前缀。
         // Font advances are rounded per glyph and summed; measure each glyph once instead of every prefix.
-        char glyph[5];
-        memcpy(glyph, s_text + end, n);
-        glyph[n] = 0;
+        char glyph[16];
+        memcpy(glyph, s_text + end, cluster);
+        glyph[cluster] = 0;
         // 行内注号占位符按图标宽度算进行宽；超出可用宽度时把图标移到下一行。
         // Charge the inline marker's icon width to the line; when it does not fit, move the icon
         // to the next line.
@@ -992,8 +1022,8 @@ static bool take_line(size_t off, int advance_limit, int hang_margin, size_t* ne
             ++glyph_count;
             last_start = end;
             last_cp = cp;
-            if (!line_append(end - visible_off, glyph, n)) return false;
-            end += n;
+            if (!line_append(end - visible_off, glyph, cluster)) return false;
+            end += cluster;
             before_last_ink = ink_end; before_last_ink_width = ink_width;
             ink_end = end; ink_width = width; ink_stretch = stretch; ink_shrink = shrink;
             previous_word = false;
@@ -1015,7 +1045,7 @@ static bool take_line(size_t off, int advance_limit, int hang_margin, size_t* ne
                     size_t split = end;
                     int64_t split_width = width;
                     int whole_cost = line_badness(available - wrap_width, wrap_stretch, wrap_shrink);
-                    if (word && english_body && hyphenate_line(visible_off, word_start, limit,
+                    if (word && english_body && !s_vietnamese_text && hyphenate_line(visible_off, word_start, limit,
                             *px, available, stretch, shrink, whole_cost, &split, &split_width)) {
                         end = split; width = split_width;
                         break;
@@ -1025,7 +1055,7 @@ static bool take_line(size_t off, int advance_limit, int hang_margin, size_t* ne
                     s_line[end - visible_off] = 0;
                     break;
                 }
-                if (word && english_body && hyphenate_line(visible_off, word_start, limit, *px,
+                if (word && english_body && !s_vietnamese_text && hyphenate_line(visible_off, word_start, limit, *px,
                         available, stretch, shrink, 10051, &end, &width)) break;
             }
             // 优先让行尾正文对齐，再允许右标点小幅悬挂到留白；超出安全宽度才回退前一字。
@@ -1039,9 +1069,10 @@ static bool take_line(size_t off, int advance_limit, int hang_margin, size_t* ne
                 if (hang < 0) hang = 0;
                 int squeeze = glyph_count > 1 ? (glyph_count - 1) * 3 : 0;
                 if (candidate <= (int64_t)available + hang + squeeze) {
-                    if (!line_append(end - visible_off, glyph, n)) return false;
+                    if (!line_append(end - visible_off, glyph, cluster)) return false;
                     width = candidate;
-                    end += n;
+                    end += cluster;
+                    s_line_hung = width > available;
                     break;
                 }
                 if (last_start > visible_off) {
@@ -1053,9 +1084,10 @@ static bool take_line(size_t off, int advance_limit, int hang_margin, size_t* ne
                 // 极窄行容不下两个字时才保留悬挂，避免出现以标点开头的死循环。
                 // Only a one-glyph-wide line may hang punctuation to avoid a non-progressing wrap.
                 if (candidate <= (int64_t)available + *px * 2) {
-                    if (!line_append(end - visible_off, glyph, n)) return false;
+                    if (!line_append(end - visible_off, glyph, cluster)) return false;
                     width = candidate;
-                    end += n;
+                    end += cluster;
+                    s_line_hung = width > available;
                     break;
                 }
             }
@@ -1067,9 +1099,10 @@ static bool take_line(size_t off, int advance_limit, int hang_margin, size_t* ne
                     s_line[end - visible_off] = 0;
                     width = last_width;
                 } else if (candidate <= (int64_t)available + *px * 2) {
-                    if (!line_append(end - visible_off, glyph, n)) return false;
+                    if (!line_append(end - visible_off, glyph, cluster)) return false;
                     width = candidate;
-                    end += n;
+                    end += cluster;
+                    s_line_hung = width > available;
                 }
             }
             break;
@@ -1079,8 +1112,8 @@ static bool take_line(size_t off, int advance_limit, int hang_margin, size_t* ne
         ++glyph_count;
         last_start = end;
         last_cp = cp;
-        if (!line_append(end - visible_off, glyph, n)) return false;
-        end += n;
+        if (!line_append(end - visible_off, glyph, cluster)) return false;
+        end += cluster;
         before_last_ink = ink_end; before_last_ink_width = ink_width;
         if (cp == ' ' || cp == '\t') {
             stretch += text_space_stretch(glyph_advance);
@@ -1244,11 +1277,14 @@ bool book_layout_build_blocks(const char* utf8, size_t len, const blk_t* blocks,
         rect.x > INT_MAX - rect.width || rect.y > INT_MAX - rect.height) return false;
     int line_height = line_height_for(px);
     if (line_height > rect.height) return false;
+    size_t vi_hits = 0;
     for (size_t off = 0; off < len;) {
         size_t n = codepoint_size(utf8 + off, len - off);
         if (!n) return false;
+        if (vi_hits < 2 && n > 1 && vietnamese_distinctive_cp(codepoint_value(utf8 + off, n))) ++vi_hits;
         off += n;
     }
+    s_vietnamese_text = vi_hits >= 2 || (vi_hits == 1 && len <= 128);
     bool sparse = blocks && count && blocks[0].reader_heading == BOOK_HEADING_TXT;
     if (count) {
         if (!blocks || count > HTML_TEXT_MAX_BLOCKS) return false;
@@ -1749,7 +1785,7 @@ void book_layout_draw_page(uint8_t* fb, size_t page, EpdRect rect, int px) {
             if (fitted) {
                 int hang = s_rect.x > 4 ? line_px / 3 : 0;
                 if (hang > s_rect.x - 4) hang = s_rect.x - 4;
-                line_extent = line_width > available ? available + hang : available;
+                line_extent = s_line_hung ? available + hang : available;
             }
             // 跟随文字保留缩进、行尾和对齐留白；整行模式铺满正文宽度。
             // 两种范围均从页左边起算虚实节奏，不改变文字布局。

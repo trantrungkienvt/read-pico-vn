@@ -222,7 +222,7 @@ bool book_name_from_path(const char *path,char *title,size_t title_cap,char *aut
     }
     // TXT 文件名中的明确作者标记不进入封面书名。/ Keep an explicit author tag out of the TXT title.
     if (!auth.n && dot && !strcasecmp(dot, ".txt")) {
-        const char *markers[] = {"作者：", "作者:"};
+        const char *markers[] = {"作者：", "作者:", "Tác giả:", "Tác giả：", "tác giả:", "tác giả："};
         for (unsigned i = 0; i < sizeof(markers) / sizeof(*markers); ++i) {
             const char *tag = strstr(s.p, markers[i]);
             const size_t len = strlen(markers[i]);

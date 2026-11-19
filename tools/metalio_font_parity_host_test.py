@@ -24,7 +24,8 @@ for n in range(len(index)-1):
    if ((record[5+bit//2]>>((bit%2)*4))&15)>=6:old[5+bit//8]|=1<<(bit%8)
   mono.extend(old)
 assert hashlib.sha256(mono).hexdigest()=='c9ab41911c03df18540b84ed6aee9121022f59f758d3b5ae3b288005218c97b3'
-covered=font_codepoints(native)|set(chars);assert len(covered)==7668
+covered=font_codepoints(native)|set(chars);assert len(covered)==7771
+assert all(ord(ch) in covered for ch in 'ĂăĐđĨĩŨũƠơƯưẠạẾếỒồỞởỰựỶỷ₫')
 common={int(line.split('#',1)[0].strip(),16) for line in (source/'tools/fixtures/reader-common-6500.txt').read_text().splitlines() if line.split('#',1)[0].strip()};assert common<=covered
 for name in ['reader_missing_advance','ttf_text_left_bearing_px']:
  assert function(name,source/'main/font/ttf_font.c')==function(name,source/'boards/pico/src/main/font/ttf_font.c'),name

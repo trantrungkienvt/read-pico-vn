@@ -623,7 +623,23 @@ static size_t entity(const char* s, size_t len, uint32_t* cp) {
     while (end < len && end <= 32 && s[end] != ';' && !ascii_space((unsigned char)s[end]) && s[end] != '&' && s[end] != '<') end++;
     if (end >= len || end > 32 || s[end] != ';') return 0;
     static const struct { const char* name; uint32_t cp; } names[] = {
-        {"amp", '&'}, {"lt", '<'}, {"gt", '>'}, {"quot", '"'}, {"apos", '\''}, {"nbsp", ' '},
+        {"amp", '&'}, {"lt", '<'}, {"gt", '>'}, {"quot", '"'}, {"apos", '\''},
+        {"nbsp", ' '}, {"ensp", ' '}, {"emsp", ' '}, {"thinsp", ' '},
+        {"ndash", 0x2013}, {"mdash", 0x2014}, {"lsquo", 0x2018}, {"rsquo", 0x2019},
+        {"ldquo", 0x201c}, {"rdquo", 0x201d}, {"hellip", 0x2026}, {"laquo", 0x00ab},
+        {"raquo", 0x00bb}, {"lsaquo", 0x2039}, {"rsaquo", 0x203a}, {"bull", 0x2022},
+        {"middot", 0x00b7}, {"deg", 0x00b0}, {"copy", 0x00a9}, {"reg", 0x00ae},
+        {"times", 0x00d7}, {"divide", 0x00f7}, {"sect", 0x00a7},
+        {"Agrave", 0x00c0}, {"Aacute", 0x00c1}, {"Acirc", 0x00c2}, {"Atilde", 0x00c3},
+        {"Egrave", 0x00c8}, {"Eacute", 0x00c9}, {"Ecirc", 0x00ca},
+        {"Igrave", 0x00cc}, {"Iacute", 0x00cd},
+        {"Ograve", 0x00d2}, {"Oacute", 0x00d3}, {"Ocirc", 0x00d4}, {"Otilde", 0x00d5},
+        {"Ugrave", 0x00d9}, {"Uacute", 0x00da}, {"Yacute", 0x00dd},
+        {"agrave", 0x00e0}, {"aacute", 0x00e1}, {"acirc", 0x00e2}, {"atilde", 0x00e3},
+        {"egrave", 0x00e8}, {"eacute", 0x00e9}, {"ecirc", 0x00ea},
+        {"igrave", 0x00ec}, {"iacute", 0x00ed},
+        {"ograve", 0x00f2}, {"oacute", 0x00f3}, {"ocirc", 0x00f4}, {"otilde", 0x00f5},
+        {"ugrave", 0x00f9}, {"uacute", 0x00fa}, {"yacute", 0x00fd},
     };
     if (end > 2 && s[1] == '#') {
         size_t i = 2;

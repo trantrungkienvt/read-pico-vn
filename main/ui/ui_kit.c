@@ -506,9 +506,17 @@ static bool title_uses_active_font(const char *sample) {
     return ttf_font_ready() && (!ttf_font_is_builtin() || ttf_font_has_text(sample));
 }
 
-static const char *title_codepoint(const char *text,char glyph[5]) {
+static const char *title_codepoint(const char *text,char glyph[16]) {
     unsigned n=1;
     while(n<4 && text[n] && ((unsigned char)text[n]&0xc0)==0x80)++n;
+    // Keep trailing Unicode combining diacritics (U+0300..U+036F) attached for NFD Vietnamese titles.
+    while(n+2<16) {
+        unsigned char b0=(unsigned char)text[n];
+        if(b0!=0xcc && b0!=0xcd) break;
+        unsigned char b1=(unsigned char)text[n+1];
+        if(!((b0==0xcc && (b1&0xc0)==0x80) || (b0==0xcd && b1>=0x80 && b1<=0xaf))) break;
+        n+=2;
+    }
     memcpy(glyph,text,n);glyph[n]=0;
     return text+n;
 }
@@ -518,7 +526,7 @@ static bool title_ui_glyph(const char *glyph) {
 static bool title_needs_ui_glyphs(const char *sample) {
     if(!sample || !title_uses_active_font(sample) || ttf_font_has_text(sample))return false;
     while(*sample) {
-        char glyph[5];sample=title_codepoint(sample,glyph);
+        char glyph[16];sample=title_codepoint(sample,glyph);
         if(title_ui_glyph(glyph))return true;
     }
     return false;
@@ -526,7 +534,7 @@ static bool title_needs_ui_glyphs(const char *sample) {
 static int title_native_px(int px,const char *sample) {
     if(!title_uses_active_font(sample) && ui_font_has_text(sample))return ui_font_title_px(px,sample);
     if(title_needs_ui_glyphs(sample))while(*sample) {
-        char glyph[5];sample=title_codepoint(sample,glyph);
+        char glyph[16];sample=title_codepoint(sample,glyph);
         if(title_ui_glyph(glyph)) {
             int native=ui_font_title_px(px,glyph);
             if(native<px)px=native;
@@ -567,7 +575,7 @@ int ui_text_title_width_px(int px, const char *text, const char *font_sample) {
     if(title_needs_ui_glyphs(sample)) {
         int width=0;
         while(*text) {
-            char glyph[5];text=title_codepoint(text,glyph);
+            char glyph[16];text=title_codepoint(text,glyph);
             width+=title_ui_glyph(glyph)?ui_font_text_width_px(px,glyph):ttf_text_width_px(px,glyph);
         }
         return width;
@@ -606,7 +614,7 @@ void ui_text_title_background_vc(uint8_t *fb, int x, int center_y, int px, const
         // same advances for measurement, alignment and drawing. No font reload.
         const char *cursor=text;
         while(*cursor) {
-            char glyph[5];cursor=title_codepoint(cursor,glyph);int a=0,b=0;
+            char glyph[16];cursor=title_codepoint(cursor,glyph);int a=0,b=0;
             if(title_ui_glyph(glyph))ui_font_measure_line_px(px,glyph,&a,&b);
             else ttf_measure_line_px(px,glyph,&a,&b);
             if(a>above)above=a;
@@ -619,7 +627,7 @@ void ui_text_title_background_vc(uint8_t *fb, int x, int center_y, int px, const
         bool prior=ttf_get_antialias();ttf_set_antialias(true);
         cursor=text;
         while(*cursor) {
-            char glyph[5];cursor=title_codepoint(cursor,glyph);
+            char glyph[16];cursor=title_codepoint(cursor,glyph);
             if(title_ui_glyph(glyph)) {
                 ui_font_draw_text_px(fb,x,baseline,px,glyph,EPD_DRAW_ALIGN_LEFT,UI_INK_BLACK,back,false);
                 x+=ui_font_text_width_px(px,glyph);
